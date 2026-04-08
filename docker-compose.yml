@@ -1,0 +1,20 @@
+services:
+  agent:
+    build: .
+    container_name: moonraker-agent
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    shm_size: "2gb"
+    volumes:
+      - agent-data:/app/data
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  agent-data:
