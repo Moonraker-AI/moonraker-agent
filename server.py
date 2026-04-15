@@ -30,6 +30,7 @@ from tasks.surge_batch_audit import run_surge_batch_audit
 from tasks.capture_design_assets import run_capture_design_assets
 from tasks.apply_neo_overlay import run_apply_neo_overlay
 from tasks.wp_scout import run_wp_scout
+from tasks.sq_scout import run_sq_scout
 
 load_dotenv()
 
@@ -155,6 +156,14 @@ class WpScoutRequest(BaseModel):
     wp_username: str
     wp_password: str
     client_slug: Optional[str] = None
+    callback_url: Optional[str] = None
+
+class SqScoutRequest(BaseModel):
+    website_url: str
+    client_slug: Optional[str] = None
+    sq_email: Optional[str] = None
+    sq_password: Optional[str] = None
+    sq_site_id: Optional[str] = None
     callback_url: Optional[str] = None
 class TaskStatusResponse(BaseModel):
     task_id: str
@@ -359,6 +368,32 @@ async def create_wp_scout(request: WpScoutRequest):
     )
 
     return {"task_id": task_id, "status": "queued"}
+
+@app.post("/tasks/sq-scout", dependencies=[Depends(verify_api_key)])
+async def create_sq_scout(request: SqScoutRequest):
+    task_id = f"sqscout-{uuid.uuid4()}"
+    now = datetime.now(timezone.utc).isoformat()
+
+    tasks[task_id] = {
+        "task_id": task_id,
+        "type": "sq-scout",
+        "status": "queued",
+        "message": "Squarespace scout queued",
+        "created_at": now,
+        "updated_at": now,
+        "error": None,
+        "duration_seconds": None,
+        "request": request.model_dump(),
+        "result": None,
+    }
+
+    asyncio.create_task(_run_sq_scout_with_lock(task_id))
+    logger.info(
+        f"Queued SQ scout {task_id[:12]} for '{request.website_url}'"
+    )
+
+    return {"task_id": task_id, "status": "queued"}
+
 @app.get("/tasks/{task_id}/status", dependencies=[Depends(verify_api_key)])
 async def get_task_status(task_id: str):
     if task_id not in tasks:
@@ -615,6 +650,37 @@ async def _run_wp_scout_with_lock(task_id: str):
                 tasks[task_id]["result"] = result
         except Exception as e:
             logger.exception(f"WP Scout {task_id[:12]} failed")
+            update_task(task_id, "error", f"Scout failed: {str(e)[:200]}", error=str(e))
+
+        logger.info(f"Post-task cooldown: {LIGHT_TASK_COOLDOWN}s")
+        await asyncio.sleep(LIGHT_TASK_COOLDOWN)
+
+
+async def _run_sq_scout_with_lock(task_id: str):
+    """Acquire the sequential execution lock, then run the SQ scout."""
+    async with browser_lock:
+        try:
+            from utils.cleanup import preflight_cleanup
+            logger.info(f"Task {task_id[:12]}: running pre-flight cleanup")
+            await asyncio.to_thread(preflight_cleanup)
+        except Exception as cleanup_err:
+            logger.warning(f"Pre-flight cleanup failed: {cleanup_err}")
+
+        update_task(task_id, "running", "Starting Squarespace scout")
+        try:
+            env = {
+                "AGENT_API_KEY": os.getenv("AGENT_API_KEY", ""),
+            }
+            result = await run_sq_scout(
+                task_id=task_id,
+                params=tasks[task_id]["request"],
+                status_callback=_async_update_task,
+                env=env,
+            )
+            if task_id in tasks and result:
+                tasks[task_id]["result"] = result
+        except Exception as e:
+            logger.exception(f"SQ Scout {task_id[:12]} failed")
             update_task(task_id, "error", f"Scout failed: {str(e)[:200]}", error=str(e))
 
         logger.info(f"Post-task cooldown: {LIGHT_TASK_COOLDOWN}s")
