@@ -23,7 +23,6 @@ from typing import Callable
 import httpx
 from browser_use import Agent, Browser
 from browser_use.llm import ChatAnthropic
-from playwright.async_api import Page
 
 logger = logging.getLogger("agent.surge")
 
@@ -40,7 +39,7 @@ SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
 
 # Timing
 POLL_INTERVAL_SECONDS = 30       # Check every 30s during Surge processing
-MAX_WAIT_MINUTES = 50            # Give up after 50 minutes
+MAX_WAIT_MINUTES = 60            # Give up after 60 minutes
 FORM_FILL_TIMEOUT_SECONDS = 120  # Max time for login + form fill phase
 
 
@@ -141,14 +140,9 @@ async def execute_surge_audit(
                 "The browser may have closed unexpectedly."
             )
 
-        # Grant clipboard permissions
-        try:
-            await page.context.grant_permissions(
-                ["clipboard-read", "clipboard-write"],
-                origin=SURGE_URL,
-            )
-        except Exception as e:
-            logger.warning(f"Could not grant clipboard permissions: {e}")
+        # Note: Browser Use 0.12.x Page wrapper doesn't expose Playwright's
+        # context for clipboard permissions. Clipboard intercept in extraction
+        # phase handles this via JS injection instead.
 
         # Wait for Surge to finish processing
         start_wait = time.time()
@@ -168,31 +162,47 @@ async def execute_surge_audit(
                 )
 
             # Check for completion indicators
+            # Browser Use 0.12.x returns its own Page wrapper, not Playwright's.
+            # Use get_url() and evaluate() with arrow function format.
             try:
-                content = await page.content()
-
-                # Check for "Run completed in" text — definitive completion signal
-                if "Run completed in" in content:
+                # Strategy 1 (primary): URL changed to results page
+                current_url = await page.get_url()
+                if "/dashboard/run/" in current_url:
                     logger.info(
-                        f"Surge completed for {practice_name} after {elapsed_min} min"
+                        f"Surge completed (URL redirect to results): {current_url}"
                     )
                     completed = True
                     break
 
-                # Check for results page indicators (backup detection)
-                if "Signal health" in content and "PAGE VARIANCE SCORE" in content:
-                    logger.info(
-                        f"Results page detected for {practice_name} after {elapsed_min} min"
-                    )
-                    completed = True
+                # Strategy 2: Check page content for completion indicators
+                content = await page.evaluate("() => document.body.innerText")
+
+                completion_indicators = [
+                    "Run completed in",
+                    "Signal Health",
+                    "Copy raw text",
+                    "trust signals",
+                    "CRES Score",
+                    "PAGE VARIANCE SCORE",
+                ]
+                for indicator in completion_indicators:
+                    if indicator in content:
+                        logger.info(
+                            f"Surge completed (found '{indicator}' in page) after {elapsed_min} min"
+                        )
+                        completed = True
+                        break
+
+                if completed:
                     break
 
                 # Check for error states
-                if "error" in content.lower() and "analysis failed" in content.lower():
+                content_lower = content.lower()
+                if "error" in content_lower and "analysis failed" in content_lower:
                     raise RuntimeError("Surge reported an analysis failure on the page")
 
                 # Check for credit exhaustion
-                if "insufficient credits" in content.lower() or "no credits" in content.lower():
+                if "insufficient credits" in content_lower or "no credits" in content_lower:
                     update_task(
                         task_id, "credits_exhausted",
                         "Surge credits exhausted. Contact the Surge team to re-up.",
@@ -201,6 +211,10 @@ async def execute_surge_audit(
                     from utils.notifications import send_credits_notification
                     await send_credits_notification(practice_name, client_slug)
                     return
+
+                # Log URL periodically for debugging
+                if elapsed_min % 5 == 0 and elapsed_min > 0:
+                    logger.info(f"Still waiting — URL: {current_url}")
 
             except Exception as e:
                 logger.warning(f"Error checking page during wait: {e}")
@@ -229,6 +243,32 @@ async def execute_surge_audit(
         logger.info(
             f"Extracted {len(surge_data)} chars of Surge data for {practice_name}"
         )
+
+        # ── Phase 3.5: Save raw data to Supabase (safety net) ────────────
+        # Persists the raw Surge output before attempting the Client HQ callback.
+        # If the callback fails, the data can be recovered from surge_raw_data column.
+        update_task(task_id, "saving_data", "Saving raw Surge data to database")
+
+        if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY:
+            try:
+                async with httpx.AsyncClient(timeout=30) as save_client:
+                    save_resp = await save_client.patch(
+                        f"{SUPABASE_URL}/rest/v1/entity_audits?id=eq.{audit_id}",
+                        json={"surge_raw_data": surge_data},
+                        headers={
+                            "apikey": SUPABASE_SERVICE_ROLE_KEY,
+                            "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+                            "Content-Type": "application/json",
+                            "Prefer": "return=minimal",
+                        },
+                    )
+                    if save_resp.status_code < 300:
+                        logger.info(f"Saved {len(surge_data)} chars of raw Surge data to Supabase")
+                    else:
+                        logger.warning(f"Failed to save raw data to Supabase: {save_resp.status_code}")
+            except Exception as save_err:
+                logger.warning(f"Could not save raw data to Supabase: {save_err}")
+                # Non-fatal: continue with callback even if direct save fails
 
         # ── Phase 4: Post results to Client HQ ──────────────────────────
         update_task(task_id, "posting_results", "Sending results to Client HQ for processing")
@@ -259,71 +299,30 @@ async def execute_surge_audit(
             except Exception:
                 pass
 
+        # Clean up temp files (browser profiles, screenshots)
+        try:
+            from utils.cleanup import full_cleanup
+            full_cleanup()
+        except Exception as cleanup_err:
+            logger.warning(f"Cleanup failed: {cleanup_err}")
+
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
-async def _get_playwright_page(agent: Agent, browser: Browser) -> Page | None:
-    """
-    Extract the active Playwright Page from Browser Use internals.
-    Browser Use wraps Playwright, so we need to reach into its objects.
-    Tries multiple access patterns for compatibility across versions.
-    """
-    # Pattern 1: agent.browser_context has a current_page
-    try:
-        if hasattr(agent, "browser_context") and agent.browser_context:
-            ctx = agent.browser_context
-            if hasattr(ctx, "current_page") and ctx.current_page:
-                return ctx.current_page
-            if hasattr(ctx, "get_current_page"):
-                return await ctx.get_current_page()
-    except Exception as e:
-        logger.debug(f"Pattern 1 failed: {e}")
 
-    # Pattern 2: browser object has context with pages
-    try:
-        if hasattr(browser, "playwright_browser") and browser.playwright_browser:
-            contexts = browser.playwright_browser.contexts
-            if contexts and contexts[0].pages:
-                return contexts[0].pages[-1]
-    except Exception as e:
-        logger.debug(f"Pattern 2 failed: {e}")
-
-    # Pattern 3: browser has _browser or _playwright_browser
-    try:
-        for attr in ("_browser", "_playwright_browser", "browser"):
-            pw_browser = getattr(browser, attr, None)
-            if pw_browser and hasattr(pw_browser, "contexts"):
-                contexts = pw_browser.contexts
-                if contexts and contexts[0].pages:
-                    return contexts[0].pages[-1]
-    except Exception as e:
-        logger.debug(f"Pattern 3 failed: {e}")
-
-    # Pattern 4: browser_context has _context (Playwright BrowserContext)
-    try:
-        if hasattr(agent, "browser_context") and agent.browser_context:
-            ctx = agent.browser_context
-            for attr in ("_context", "context", "playwright_context"):
-                pw_ctx = getattr(ctx, attr, None)
-                if pw_ctx and hasattr(pw_ctx, "pages") and pw_ctx.pages:
-                    return pw_ctx.pages[-1]
-    except Exception as e:
-        logger.debug(f"Pattern 4 failed: {e}")
-
-    logger.error("All patterns to access Playwright page failed")
-    return None
-
-
-async def _extract_surge_data(page: Page) -> str:
+async def _extract_surge_data(page) -> str:
     """
     Extract the Surge audit data from the results page.
 
+    Uses Browser Use 0.12.x Page wrapper API:
+    - page.evaluate("() => ...") for JS execution (arrow function required)
+    - page.get_elements_by_css_selector() for DOM queries
+
     Strategy:
-    1. Inject clipboard interceptor
-    2. Click the "Copy raw text" button
-    3. Read intercepted text
-    4. Fallback: try navigator.clipboard.readText()
-    5. Fallback: extract from Export Report if available
+    1. Inject clipboard interceptor + click Copy button
+    2. Fallback: try clipboard.readText()
+    3. Fallback: click all Copy buttons and concatenate
+    4. Fallback: extract page text content
     """
     surge_data = None
 
@@ -333,37 +332,30 @@ async def _extract_surge_data(page: Page) -> str:
         await page.evaluate("""() => {
             window.__surgeCopiedText = null;
 
-            // Intercept clipboard.writeText
             const origWriteText = navigator.clipboard.writeText.bind(navigator.clipboard);
-            navigator.clipboard.writeText = async (text) => {
+            navigator.clipboard.writeText = (text) => {
                 window.__surgeCopiedText = text;
                 return origWriteText(text);
             };
 
-            // Also intercept execCommand('copy') for older approach
             const origExecCommand = document.execCommand.bind(document);
-            document.execCommand = function(cmd, ...args) {
+            document.execCommand = (cmd, ...args) => {
                 if (cmd === 'copy') {
-                    const selection = window.getSelection();
-                    if (selection) {
-                        window.__surgeCopiedText = selection.toString();
-                    }
+                    const sel = window.getSelection();
+                    if (sel) window.__surgeCopiedText = sel.toString();
                 }
                 return origExecCommand(cmd, ...args);
             };
         }""")
 
-        # Find and click the Copy button between Signal health and trust signals
-        # The button has title="Copy raw text"
-        copy_buttons = await page.query_selector_all('button[title="Copy raw text"]')
+        # Find and click the Copy button
+        copy_buttons = await page.get_elements_by_css_selector('button[title="Copy raw text"]')
 
         if copy_buttons:
-            # Click the FIRST one (the main copy button between sections)
             await copy_buttons[0].click()
             await asyncio.sleep(2)
 
-            # Read intercepted text
-            surge_data = await page.evaluate("window.__surgeCopiedText")
+            surge_data = await page.evaluate("() => window.__surgeCopiedText")
 
             if surge_data:
                 logger.info(f"Extracted {len(surge_data)} chars via clipboard intercept")
@@ -374,14 +366,13 @@ async def _extract_surge_data(page: Page) -> str:
 
     # Strategy 2: Try reading clipboard directly
     try:
-        await page.evaluate("""async () => {
-            // Re-click the button
+        await page.evaluate("""() => {
             const btn = document.querySelector('button[title="Copy raw text"]');
             if (btn) btn.click();
         }""")
         await asyncio.sleep(2)
 
-        surge_data = await page.evaluate("navigator.clipboard.readText()")
+        surge_data = await page.evaluate("() => navigator.clipboard.readText()")
         if surge_data and len(surge_data) > 50:
             logger.info(f"Extracted {len(surge_data)} chars via clipboard.readText()")
             return surge_data
@@ -391,19 +382,14 @@ async def _extract_surge_data(page: Page) -> str:
 
     # Strategy 3: Click all section Copy buttons and concatenate
     try:
-        copy_buttons = await page.query_selector_all('button[title="Copy raw text"]')
-        if not copy_buttons:
-            # Try broader selector
-            copy_buttons = await page.query_selector_all(
-                'button:has-text("Copy")'
-            )
+        copy_buttons = await page.get_elements_by_css_selector('button[title="Copy raw text"]')
 
         all_text = []
         for btn in copy_buttons:
-            await page.evaluate("""() => { window.__surgeCopiedText = null; }""")
+            await page.evaluate("() => { window.__surgeCopiedText = null; }")
             await btn.click()
             await asyncio.sleep(1)
-            text = await page.evaluate("window.__surgeCopiedText")
+            text = await page.evaluate("() => window.__surgeCopiedText")
             if text:
                 all_text.append(text)
 
@@ -420,7 +406,6 @@ async def _extract_surge_data(page: Page) -> str:
     # Strategy 4: Extract page text content as last resort
     try:
         surge_data = await page.evaluate("""() => {
-            // Try to find the main content area
             const main = document.querySelector('main')
                 || document.querySelector('[class*="report"]')
                 || document.querySelector('[class*="result"]')
@@ -452,8 +437,8 @@ async def _post_results_to_client_hq(audit_id: str, surge_data: str):
             },
             headers={
                 "Content-Type": "application/json",
-                # Use Supabase service role for auth (same as internal API calls)
-                "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+                # Use agent API key for auth (accepted by Client HQ requireAdminOrInternal)
+                "Authorization": f"Bearer {AGENT_API_KEY}",
             },
         )
 
