@@ -1,4 +1,7 @@
 .env
+.env.backup
 __pycache__/
 *.pyc
 data/
+*.log
+.DS_Store
