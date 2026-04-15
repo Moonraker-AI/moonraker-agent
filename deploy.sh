@@ -1,64 +1,82 @@
 #!/bin/bash
-# Deploy Moonraker Agent Service to VPS
-# Run from: /home/claude/moonraker-agent/
-# Usage: bash deploy.sh
+# deploy.sh — Pull latest code from GitHub and rebuild the agent container
+# Usage: ./deploy.sh [--no-cache]
+#
+# Run from /opt/moonraker-agent on the VPS, or trigger via admin/exec:
+#   curl -X POST -H "Authorization: Bearer $TOKEN" \
+#     https://agent.moonraker.ai/admin/exec \
+#     -d '{"command": "cd /opt/moonraker-agent && bash deploy.sh", "timeout": 300}'
 
 set -e
 
-VPS="root@204.168.251.129"
-REMOTE_DIR="/opt/moonraker-agent"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR"
 
-echo "=== Deploying Moonraker Agent Service ==="
+echo "=== Moonraker Agent Deploy ==="
+echo "Time: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+echo "Directory: $(pwd)"
 
-# 1. Create tar of all files (exclude deploy script itself)
-echo "Packaging files..."
-tar czf /tmp/agent-deploy.tar.gz \
-  --exclude='deploy.sh' \
-  --exclude='.env.example' \
-  -C /home/claude/moonraker-agent .
+# Step 1: Pull latest from GitHub
+echo ""
+echo "--- Step 1: Git pull ---"
+git fetch origin main
+LOCAL=$(git rev-parse HEAD)
+REMOTE=$(git rev-parse origin/main)
 
-# 2. Upload to VPS
-echo "Uploading to VPS..."
-scp /tmp/agent-deploy.tar.gz $VPS:/tmp/
-
-# 3. Extract and rebuild on VPS
-echo "Extracting and rebuilding..."
-ssh $VPS << 'REMOTE'
-  set -e
-  cd /opt/moonraker-agent
-
-  # Back up current .env if it exists and has been customized
-  if [ -f .env ]; then
-    cp .env .env.backup
-  fi
-
-  # Extract new files
-  tar xzf /tmp/agent-deploy.tar.gz
-
-  # Restore backed-up .env if it had more content than the new one
-  if [ -f .env.backup ]; then
-    # Only restore if backup has filled-in keys (not just template)
-    if grep -q "ANTHROPIC_API_KEY=sk-" .env.backup 2>/dev/null; then
-      echo "Restoring customized .env from backup"
-      cp .env.backup .env
+if [ "$LOCAL" = "$REMOTE" ]; then
+    echo "Already up to date at $(git log --oneline -1)"
+    # Still rebuild if --force flag is passed
+    if [ "$1" != "--force" ] && [ "$1" != "--no-cache" ]; then
+        echo "Use --force to rebuild anyway, or --no-cache for clean rebuild"
+        echo "Checking if container is running..."
+        if docker compose ps --format json | python3 -c "import sys,json; data=[json.loads(l) for l in sys.stdin if l.strip()]; print('running' if any(d.get('State')=='running' for d in data) else 'stopped')" 2>/dev/null | grep -q "running"; then
+            echo "Container is running. No action needed."
+            exit 0
+        else
+            echo "Container not running. Will restart."
+        fi
     fi
-  fi
+else
+    echo "Updating: $(git log --oneline -1) -> $(git log --oneline origin/main -1)"
+    git reset --hard origin/main
+    echo "Now at: $(git log --oneline -1)"
+fi
 
-  # Rebuild and restart
-  echo "Rebuilding Docker image..."
-  docker compose build --no-cache
+# Step 2: Rebuild and restart container
+echo ""
+echo "--- Step 2: Docker rebuild ---"
 
-  echo "Restarting service..."
-  docker compose down
-  docker compose up -d
+BUILD_FLAG=""
+if [ "$1" = "--no-cache" ]; then
+    BUILD_FLAG="--no-cache"
+    echo "Building with --no-cache (clean rebuild)"
+fi
 
-  # Wait and check health
-  sleep 5
-  echo "Checking health..."
-  curl -s http://localhost:8000/health | python3 -m json.tool
+docker compose down
+docker compose build $BUILD_FLAG
+docker compose up -d
 
-  echo "=== Deploy complete ==="
-REMOTE
+# Step 3: Wait for health check
+echo ""
+echo "--- Step 3: Health check ---"
+sleep 5
 
-rm /tmp/agent-deploy.tar.gz
-echo "Done!"
+AGENT_API_KEY=$(grep AGENT_API_KEY .env | head -1 | cut -d'=' -f2)
+HEALTH=$(curl -s --max-time 10 -H "Authorization: Bearer $AGENT_API_KEY" http://127.0.0.1:8000/health 2>/dev/null || echo '{"status":"error"}')
+STATUS=$(echo "$HEALTH" | python3 -c "import sys,json; print(json.load(sys.stdin).get('status','error'))" 2>/dev/null || echo "error")
+
+if [ "$STATUS" = "ok" ]; then
+    echo "Health check: OK"
+    echo "$HEALTH" | python3 -m json.tool 2>/dev/null || echo "$HEALTH"
+else
+    echo "Health check: FAILED"
+    echo "Response: $HEALTH"
+    echo ""
+    echo "Container logs (last 20 lines):"
+    docker compose logs --tail 20
+    exit 1
+fi
+
+echo ""
+echo "=== Deploy complete ==="
+echo "Time: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
