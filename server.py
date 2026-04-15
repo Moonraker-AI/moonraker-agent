@@ -376,6 +376,23 @@ async def get_task_status(task_id: str):
     )
 
 
+@app.get("/tasks/{task_id}/result", dependencies=[Depends(verify_api_key)])
+async def get_task_result(task_id: str):
+    """Get the full result data for a completed task."""
+    if task_id not in tasks:
+        raise HTTPException(status_code=404, detail="Task not found")
+    t = tasks[task_id]
+    if t["status"] not in ("complete", "error"):
+        raise HTTPException(status_code=409, detail=f"Task still {t['status']}, no result yet")
+    return {
+        "task_id": t["task_id"],
+        "status": t["status"],
+        "type": t.get("type", ""),
+        "result": t.get("result"),
+        "duration_seconds": t.get("duration_seconds"),
+    }
+
+
 @app.get("/tasks", dependencies=[Depends(verify_api_key)])
 async def list_tasks(status: Optional[str] = None, limit: int = 20):
     """List recent tasks, optionally filtered by status."""
@@ -588,12 +605,14 @@ async def _run_wp_scout_with_lock(task_id: str):
             env = {
                 "AGENT_API_KEY": os.getenv("AGENT_API_KEY", ""),
             }
-            await run_wp_scout(
+            result = await run_wp_scout(
                 task_id=task_id,
                 params=tasks[task_id]["request"],
                 status_callback=_async_update_task,
                 env=env,
             )
+            if task_id in tasks and result:
+                tasks[task_id]["result"] = result
         except Exception as e:
             logger.exception(f"WP Scout {task_id[:12]} failed")
             update_task(task_id, "error", f"Scout failed: {str(e)[:200]}", error=str(e))

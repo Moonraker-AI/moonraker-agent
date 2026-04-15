@@ -85,6 +85,7 @@ async def run_wp_scout(task_id, params, status_callback, env):
         summary = _build_summary(report)
         await status_callback(task_id, "complete", f"Scout complete (REST API): {summary}")
         await _send_results(task_id, report, callback_url, agent_api_key)
+        return report
         return
 
     # ── PHASE 2: Browser fallback ────────────────────────────────────────
@@ -108,6 +109,7 @@ async def run_wp_scout(task_id, params, status_callback, env):
 
     await status_callback(task_id, final_status, msg)
     await _send_results(task_id, report, callback_url, agent_api_key)
+    return report
 
 
 # ── REST API approach ────────────────────────────────────────────────────

@@ -1,5 +1,7 @@
 .env
-.env.backup
+.env.*
+!.env.example
+*.backup
 __pycache__/
 *.pyc
 data/
