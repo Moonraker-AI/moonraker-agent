@@ -842,6 +842,9 @@ async def _sq_login(page, email, password, report):
             return False
 
         await email_field.fill(email)
+        # Also dispatch input event for React-controlled forms
+        await page.evaluate("el => el.dispatchEvent(new Event('input', {bubbles: true}))", email_field)
+        await asyncio.sleep(0.3)
 
         # Look for password field (may be on same page or appear after email)
         pass_field = None
@@ -882,9 +885,16 @@ async def _sq_login(page, email, password, report):
             report["screenshots"]["login_no_password"] = await _take_screenshot(page)
             return False
 
-        await pass_field.fill(password)
+        # Use click + keyboard typing for password (more reliable with React forms)
+        await pass_field.click()
+        await asyncio.sleep(0.2)
+        await page.keyboard.type(password, delay=15)
+        await asyncio.sleep(0.3)
 
         # Click login button
+        # Take pre-submit screenshot for debugging
+        report["screenshots"]["pre_login"] = await _take_screenshot(page)
+        logger.info("Clicking LOG IN button...")
         submit_btn = await page.query_selector(
             'button[type="submit"], button[data-test="login-button"], '
             'button.login-button, input[type="submit"]'
