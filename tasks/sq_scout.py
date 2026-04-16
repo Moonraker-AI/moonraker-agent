@@ -813,10 +813,11 @@ async def _scan_admin_panel(
 
 
 async def _sq_login(page, email, password, report):
-    """Log in to Squarespace at login.squarespace.com."""
+    """Log in to Squarespace at login.squarespace.com.
+    Uses App Password which bypasses 2FA."""
 
     try:
-        await page.goto("https://login.squarespace.com/", wait_until="networkidle", timeout=20000)
+        await page.goto("https://login.squarespace.com/", wait_until="networkidle", timeout=25000)
         await asyncio.sleep(2)
 
         # Look for email field
@@ -837,11 +838,12 @@ async def _sq_login(page, email, password, report):
 
         if not email_field:
             report["errors"].append("Could not find email field on Squarespace login")
+            report["screenshots"]["login_page"] = await _take_screenshot(page)
             return False
 
         await email_field.fill(email)
 
-        # Look for password field
+        # Look for password field (may be on same page or appear after email)
         pass_field = None
         pass_selectors = [
             'input[name="password"]',
@@ -858,8 +860,7 @@ async def _sq_login(page, email, password, report):
                 continue
 
         if not pass_field:
-            # Squarespace might use a two-step login (email first, then password)
-            # Click the continue/next button
+            # Two-step login: click continue to reveal password field
             continue_btn = await page.query_selector(
                 'button[type="submit"], button[data-test="login-button"], '
                 'button.login-button, input[type="submit"]'
@@ -868,7 +869,6 @@ async def _sq_login(page, email, password, report):
                 await continue_btn.click()
                 await asyncio.sleep(2)
 
-            # Now look for password field
             for sel in pass_selectors:
                 try:
                     pass_field = await page.wait_for_selector(sel, timeout=5000)
@@ -879,6 +879,7 @@ async def _sq_login(page, email, password, report):
 
         if not pass_field:
             report["errors"].append("Could not find password field on Squarespace login")
+            report["screenshots"]["login_no_password"] = await _take_screenshot(page)
             return False
 
         await pass_field.fill(password)
@@ -893,24 +894,37 @@ async def _sq_login(page, email, password, report):
         else:
             await pass_field.press("Enter")
 
-        # Wait for navigation
-        await page.wait_for_load_state("networkidle", timeout=15000)
-        await asyncio.sleep(3)
+        # Wait for the full redirect chain to complete.
+        # Squarespace login goes: login.squarespace.com -> OAuth flow -> account.squarespace.com
+        # We need to wait until we're OFF login.squarespace.com entirely.
+        logger.info("Login submitted, waiting for redirect chain...")
+        for attempt in range(15):
+            await asyncio.sleep(2)
+            current_url = page.url
+            current_host = urlparse(current_url).hostname or ""
+            logger.info(f"Login redirect check {attempt}: {current_host} - {current_url[:120]}")
 
-        # Check if we landed on the dashboard or site selector
-        current_url = page.url
-        if "login" not in current_url.lower() or "account" in current_url.lower():
-            logger.info(f"Squarespace login appears successful, landed at: {current_url}")
-            return True
+            # Success: we've left the login domain
+            if current_host not in ("login.squarespace.com", ""):
+                logger.info(f"Squarespace login successful, landed at: {current_url[:120]}")
+                report["login"] = {"success": True, "method": "app_password", "landed_url": current_url[:200]}
+                return True
 
-        # Check for error messages
-        error_el = await page.query_selector(
-            '.error-message, [data-test="error-message"], .form-error'
-        )
-        if error_el:
-            error_text = await error_el.inner_text()
-            report["errors"].append(f"Login error: {error_text[:200]}")
+            # Check for error messages on login page
+            error_el = await page.query_selector(
+                '.error-message, [data-test="error-message"], .form-error, '
+                '[class*="error"], [class*="Error"]'
+            )
+            if error_el:
+                error_text = await error_el.inner_text()
+                if error_text.strip():
+                    report["errors"].append(f"Login error: {error_text.strip()[:200]}")
+                    report["screenshots"]["login_error"] = await _take_screenshot(page)
+                    return False
 
+        # Timed out waiting for redirect
+        report["errors"].append(f"Login redirect timed out. Still on: {page.url[:200]}")
+        report["screenshots"]["login_timeout"] = await _take_screenshot(page)
         return False
 
     except Exception as e:
@@ -919,66 +933,137 @@ async def _sq_login(page, email, password, report):
 
 
 async def _navigate_to_site(page, website_url, sq_site_id, report):
-    """Navigate to the correct site in the Squarespace dashboard."""
+    """Navigate to the correct site in the Squarespace dashboard.
+    After login, we land on account.squarespace.com or similar.
+    We need to find and click into the correct client site."""
 
     current_url = page.url
+    logger.info(f"Navigate to site: starting from {current_url[:120]}")
 
     # If we're already on a site config page, we're good
     if "/config" in current_url:
         return True
 
-    # Try navigating directly via the website URL's config path
+    # Parse target domain for matching
     parsed = urlparse(website_url)
-    domain = parsed.netloc.replace("www.", "")
+    target_domain = parsed.netloc.replace("www.", "").lower()
 
-    # Squarespace admin URL patterns
-    admin_urls = [
-        f"{website_url}/config",
-        f"https://app.squarespace.com",
+    # Step 1: Navigate to the account/sites page
+    sites_urls = [
+        "https://account.squarespace.com",
+        "https://app.squarespace.com",
     ]
 
-    for url in admin_urls:
+    for sites_url in sites_urls:
         try:
-            await page.goto(url, wait_until="domcontentloaded", timeout=15000)
-            await asyncio.sleep(2)
+            logger.info(f"Trying sites page: {sites_url}")
+            await page.goto(sites_url, wait_until="domcontentloaded", timeout=20000)
+            await asyncio.sleep(3)
 
             current = page.url
-            # If we're on a config page or site dashboard, success
-            if "/config" in current or "app.squarespace.com" in current:
-                # If on site selector, look for the right site
-                if "sites" in current or "account" in current:
-                    # Try to find and click the correct site
-                    site_links = await page.query_selector_all('a[href*="/config"]')
-                    for link in site_links:
-                        href = await link.get_attribute("href")
-                        text = await link.inner_text()
-                        if domain in (href or "").lower() or domain in text.lower():
-                            await link.click()
-                            await page.wait_for_load_state("networkidle", timeout=10000)
-                            return True
+            logger.info(f"Landed on: {current[:120]}")
 
-                    # If sq_site_id provided, try direct URL
-                    if sq_site_id:
-                        await page.goto(
-                            f"https://{sq_site_id}.squarespace.com/config",
-                            wait_until="domcontentloaded",
-                            timeout=15000,
-                        )
+            # Take a screenshot of the site selector for debugging
+            report["screenshots"]["site_selector"] = await _take_screenshot(page)
+
+            # Step 2: Look for site cards/links that match our target domain
+            # Squarespace site selector shows site names and sometimes domains
+            # Try multiple strategies to find the right site
+
+            # Strategy A: Look for links containing the domain
+            all_links = await page.query_selector_all("a[href]")
+            for link in all_links:
+                try:
+                    href = (await link.get_attribute("href") or "").lower()
+                    text = (await link.inner_text() or "").lower().strip()
+
+                    # Match by domain in href or text
+                    if target_domain in href or target_domain in text:
+                        logger.info(f"Found matching site link: href={href[:80]}, text={text[:40]}")
+                        await link.click()
+                        await page.wait_for_load_state("domcontentloaded", timeout=15000)
+                        await asyncio.sleep(2)
+                        if "/config" in page.url:
+                            logger.info(f"Successfully navigated to site config: {page.url[:80]}")
+                            return True
+                except Exception:
+                    continue
+
+            # Strategy B: Look for site cards with data attributes
+            site_cards = await page.query_selector_all(
+                '[class*="site"], [class*="Site"], [data-test*="site"], '
+                '[class*="website"], [class*="Website"]'
+            )
+            for card in site_cards:
+                try:
+                    text = (await card.inner_text() or "").lower()
+                    if target_domain in text or target_domain.split(".")[0] in text:
+                        logger.info(f"Found matching site card: {text[:60]}")
+                        # Try clicking the card itself
+                        await card.click()
+                        await page.wait_for_load_state("domcontentloaded", timeout=15000)
                         await asyncio.sleep(2)
                         if "/config" in page.url:
                             return True
+                        # Might need to click a link inside the card
+                        break
+                except Exception:
+                    continue
 
-                    # Click first site as fallback
-                    if site_links:
-                        await site_links[0].click()
-                        await page.wait_for_load_state("networkidle", timeout=10000)
+            # Strategy C: Get all visible text and find clickable elements near domain mentions
+            page_text = await page.inner_text("body")
+            if target_domain in page_text.lower():
+                logger.info(f"Domain '{target_domain}' found in page text, trying to locate clickable element...")
+                # Use evaluate to find the element containing the domain
+                clicked = await page.evaluate("""
+                    (domain) => {
+                        const walker = document.createTreeWalker(
+                            document.body, NodeFilter.SHOW_TEXT, null, false
+                        );
+                        while (walker.nextNode()) {
+                            if (walker.currentNode.textContent.toLowerCase().includes(domain)) {
+                                let el = walker.currentNode.parentElement;
+                                // Walk up to find a clickable ancestor
+                                for (let i = 0; i < 5; i++) {
+                                    if (el.tagName === 'A' || el.onclick || el.getAttribute('role') === 'button') {
+                                        el.click();
+                                        return true;
+                                    }
+                                    el = el.parentElement;
+                                    if (!el) break;
+                                }
+                            }
+                        }
+                        return false;
+                    }
+                """, target_domain)
+                if clicked:
+                    await asyncio.sleep(3)
+                    if "/config" in page.url:
                         return True
-                else:
+
+            # Strategy D: If the page shows sites, try clicking into the first one
+            # to see where it goes (useful when domain isn't visible in the card)
+            first_site_link = await page.query_selector(
+                'a[href*="/config"], a[href*="squarespace.com/config"]'
+            )
+            if first_site_link:
+                href = await first_site_link.get_attribute("href")
+                logger.info(f"Trying first config link: {href[:80]}")
+                await first_site_link.click()
+                await page.wait_for_load_state("domcontentloaded", timeout=15000)
+                await asyncio.sleep(2)
+                if "/config" in page.url:
+                    # Check if this is the right site by looking at the domain settings
                     return True
+
         except Exception as e:
-            logger.debug(f"Navigate attempt to {url} failed: {e}")
+            logger.warning(f"Site navigation via {sites_url} failed: {e}")
             continue
 
+    # All strategies failed - take a screenshot for debugging
+    report["screenshots"]["nav_failed"] = await _take_screenshot(page)
+    logger.warning(f"Could not navigate to site. Final URL: {page.url[:120]}")
     return False
 
 
