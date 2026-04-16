@@ -74,8 +74,8 @@ async def run_sq_scout(task_id, params, status_callback, env):
     """
     website_url = params.get("website_url", "").rstrip("/")
     client_slug = params.get("client_slug", "")
-    sq_email = params.get("sq_email", "")
-    sq_password = params.get("sq_password", "")
+    sq_email = params.get("sq_email", "") or env.get("SQ_EMAIL", "")
+    sq_password = params.get("sq_password", "") or env.get("SQ_PASSWORD", "")
     sq_site_id = params.get("sq_site_id", "")
     callback_url = params.get("callback_url", "")
     agent_api_key = env.get("AGENT_API_KEY", "")
@@ -164,7 +164,7 @@ async def run_sq_scout(task_id, params, status_callback, env):
 
     # ── PHASE 2: Admin panel (if credentials provided) ──────────────────
     if sq_email and sq_password:
-        await status_callback(task_id, "running", "Credentials provided, accessing admin panel...")
+        await status_callback(task_id, "running", "Logging in to Squarespace admin...")
         admin_success = await _scan_admin_panel(
             website_url, sq_email, sq_password, sq_site_id,
             report, status_callback, task_id
