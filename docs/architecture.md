@@ -62,10 +62,10 @@ This hybrid approach keeps costs low while handling both predictable and unpredi
 
 | Property | Value |
 |---|---|
-| IP | 204.168.251.129 |
-| Plan | CX23 (2 vCPU, 4GB RAM, 40GB SSD) |
+| IP | 87.99.133.69 |
+| Plan | CPX31 (2 vCPU, 4GB RAM) |
 | OS | Ubuntu 24.04 |
-| Location | Helsinki |
+| Location | Ashburn |
 | Cost | ~$5.59/mo |
 
 ### Docker container

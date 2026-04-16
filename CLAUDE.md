@@ -5,7 +5,7 @@
 A self-hosted Python/FastAPI service that runs autonomous browser automation tasks for Moonraker AI's Client HQ platform. Currently handles Surge entity audit automation.
 
 **Production URL:** `https://agent.moonraker.ai`
-**VPS:** Hetzner CX23 at `204.168.251.129` (Helsinki, Ubuntu 24.04, 2 vCPU / 4GB RAM)
+**VPS:** Hetzner CPX31 at `87.99.133.69` (Ashburn, Ubuntu 24.04, 2 vCPU / 4GB RAM)
 **Stack:** Python 3.12, FastAPI, Browser Use 0.12.x, Docker, Caddy reverse proxy
 
 ## Architecture
@@ -52,7 +52,7 @@ All code lives at `/opt/moonraker-agent/` on the VPS. There is no CI/CD pipeline
 ### To deploy changes:
 
 ```bash
-ssh root@204.168.251.129
+ssh root@87.99.133.69
 cd /opt/moonraker-agent
 
 # Edit files directly, or SCP them up

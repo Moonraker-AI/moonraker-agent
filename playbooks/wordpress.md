@@ -48,7 +48,7 @@ After login, confirm you are on the Dashboard by checking:
 
 - **Two-factor authentication (2FA):** Some sites use plugins like Wordfence or Google Authenticator. If a 2FA screen appears, abort and report.
 - **CAPTCHA on login:** If a CAPTCHA challenge appears, abort and report.
-- **WAF/Security challenges:** SiteGround (`sg-captcha: challenge`), Cloudflare, Sucuri, or Wordfence may serve JS challenges. The agent IP (204.168.251.129) must be whitelisted in the hosting security settings.
+- **WAF/Security challenges:** SiteGround (`sg-captcha: challenge`), Cloudflare, Sucuri, or Wordfence may serve JS challenges. The agent IP (87.99.133.69) must be whitelisted in the hosting security settings.
 - **Custom login URL:** Plugins like WPS Hide Login change `/wp-login.php` to a custom path. The task payload must include the correct URL.
 - **Maintenance mode:** If you see "Briefly unavailable for scheduled maintenance", wait 30 seconds and retry (up to 3 times).
 
