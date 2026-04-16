@@ -701,6 +701,8 @@ async def _run_sq_scout_with_lock(task_id: str):
         try:
             env = {
                 "AGENT_API_KEY": os.getenv("AGENT_API_KEY", ""),
+                "SQ_EMAIL": os.getenv("SQ_EMAIL", ""),
+                "SQ_PASSWORD": os.getenv("SQ_PASSWORD", ""),
             }
             result = await run_sq_scout(
                 task_id=task_id,
