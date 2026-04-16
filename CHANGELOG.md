@@ -1,5 +1,26 @@
 # Changelog
 
+## v0.6.0 (2026-04-15)
+
+### Added
+- Squarespace scout task (`tasks/sq_scout.py`) for SQ site reconnaissance
+- Squarespace playbook v1 (`playbooks/squarespace.md`)
+- Wix scout task (`tasks/wix_scout.py`) for Wix site reconnaissance
+- Wix playbook v1 (`playbooks/wix.md`)
+- `GET /tasks/{task_id}/result` endpoint documented in API contract
+
+### Architecture
+- All three scouts follow the same pattern: public httpx crawl first (fast, 5-10s), browser fallback if needed
+- SQ scout: detects version (7.0/7.1), template family, pages, nav, SEO, connected services, fonts, blog, schema, code injection. Optional admin panel scan with contributor credentials
+- Wix scout: detects site ID, Wix Studio/Editor X, pages, nav (with browser fallback for JS-rendered sites), blog, Wix apps, tracking scripts
+- Both new scouts use browser_lock (Tier 2) with LIGHT_TASK_COOLDOWN
+
+### Client HQ integration
+- Unified `api/trigger-cms-scout.js` dispatches to correct agent endpoint based on `website_platform`
+- `api/ingest-cms-scout.js` callback stores reports in `cms_scouts` Supabase table
+- Scout button in Content tab now visible for WordPress, Squarespace, and Wix clients
+- Auto-loads latest scout result; polls for completion with 5s interval
+
 ## v0.5.0 (2026-04-15)
 
 ### Added
