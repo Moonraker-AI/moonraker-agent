@@ -46,6 +46,27 @@ Response 200:
 }
 ```
 
+### Task result
+
+Returns the full result data for completed tasks (scouts store report here).
+
+```
+GET /tasks/{task_id}/result
+Authorization: Bearer {AGENT_API_KEY}
+
+Response 200:
+{
+  "task_id": "sqscout-abc123",
+  "status": "complete",
+  "type": "sq-scout",
+  "result": { ... },              // Full scout report or task output
+  "duration_seconds": 6
+}
+
+Response 409 (task not yet complete):
+{ "detail": "Task still running, no result yet" }
+```
+
 ### List tasks
 
 ```
@@ -236,6 +257,80 @@ POST /tasks/wp-scout
   "permalink_structure": "/%postname%/",
   "media_stats": { "total_items": 234 },
   "screenshots": { "dashboard": "base64...", "plugins": "base64..." },
+  "errors": []
+}
+```
+
+### Squarespace scout
+
+Reconnaissance of a Squarespace site. Public crawl first (fast, no auth), optional admin panel scan if credentials provided.
+
+```
+POST /tasks/sq-scout
+{
+  "website_url": "https://www.example.com",
+  "client_slug": "client-name",                  // optional
+  "sq_email": "support@moonraker.ai",            // optional (enables admin panel scan)
+  "sq_password": "...",                           // optional
+  "sq_site_id": "fox-panda-abc123",              // optional (multi-site disambiguation)
+  "callback_url": "https://clients.moonraker.ai/api/ingest-cms-scout"  // optional
+}
+```
+
+**Result:**
+```json
+{
+  "scout_version": "1.0",
+  "platform": "squarespace",
+  "scanned_at": "2026-04-15T09:50:00Z",
+  "method": "public",
+  "site_info": {
+    "title": "Practice Name",
+    "squarespace_version": "7.1",
+    "template_family": "Native",
+    "site_id": "abc123"
+  },
+  "pages": [ { "url": "/about", "title": "...", "h1": "...", "image_count": 5, "has_meta_description": true } ],
+  "navigation": { "main_nav": [...], "footer_nav": [...] },
+  "blog": { "has_blog": true, "blog_url": "/blog", "post_count": 12 },
+  "seo": { "has_schema": true, "schema_types": ["LocalBusiness"], "has_sitemap": true },
+  "connected_services": { "google_analytics": "G-XXX", "google_tag_manager": "GTM-XXX" },
+  "design": { "custom_css": true, "detected_fonts": ["Playfair Display"] },
+  "errors": []
+}
+```
+
+### Wix scout
+
+Reconnaissance of a Wix site. Public crawl with browser fallback for JS-rendered navigation.
+
+```
+POST /tasks/wix-scout
+{
+  "website_url": "https://www.example.com",
+  "client_slug": "client-name",                  // optional
+  "callback_url": "https://clients.moonraker.ai/api/ingest-cms-scout"  // optional
+}
+```
+
+**Result:**
+```json
+{
+  "scout_version": "1.0",
+  "platform": "wix",
+  "scanned_at": "2026-04-15T09:55:00Z",
+  "method": "public",
+  "site_info": {
+    "title": "Practice Name",
+    "wix_site_id": "abc-123",
+    "is_wix_studio": false
+  },
+  "pages": [ { "url": "/about", "title": "...", "h1": "...", "image_count": 8, "has_meta_description": true } ],
+  "navigation": { "main_nav": [...], "footer_nav": [...] },
+  "blog": { "has_blog": false },
+  "seo": { "has_schema": true, "schema_types": ["WebSite", "MedicalBusiness"] },
+  "connected_services": { "google_analytics": "G-XXX" },
+  "wix_apps": ["Wix Bookings", "Wix Blog"],
   "errors": []
 }
 ```
