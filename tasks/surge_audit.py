@@ -25,7 +25,7 @@ from browser_use import Agent, Browser
 from browser_use.llm import ChatAnthropic
 
 from utils.debug_capture import capture_debug
-from utils.supabase_patch import patch_audit_terminal
+from utils.supabase_patch import patch_audit_terminal, should_suppress_notification
 
 logger = logging.getLogger("agent.surge")
 
@@ -82,7 +82,7 @@ async def _terminal_fail(
 
     # 2. Supabase terminal PATCH — best-effort, returns False on failure
     try:
-        await patch_audit_terminal(audit_id, status_code, error_detail)
+        await patch_audit_terminal(audit_id, status_code, error_detail, debug_path)
     except Exception as pe:
         logger.warning(f"Supabase PATCH failed in _terminal_fail: {pe}")
 
@@ -92,9 +92,23 @@ async def _terminal_fail(
     except Exception as ue:
         logger.warning(f"update_task failed in _terminal_fail: {ue}")
 
-    # 4. Team email notification
+    # 4. Team email notification — but suppress if another audit already
+    # failed with the same reason_code in the last 2 hours, so a systemic
+    # Surge outage does not flood the team's inbox. Fail-open: if the
+    # suppression check errors, the email still goes through.
     try:
-        await notify_fn(practice_name, client_slug, debug_path)
+        suppress = False
+        try:
+            suppress = await should_suppress_notification(status_code, audit_id)
+        except Exception as se:
+            logger.warning(f"Suppression check failed in _terminal_fail: {se}")
+        if suppress:
+            logger.info(
+                f"Skipping {status_code} notification for audit {audit_id} "
+                f"(another recent failure with same code)"
+            )
+        else:
+            await notify_fn(practice_name, client_slug, debug_path)
     except Exception as ne:
         logger.warning(f"Notification failed in _terminal_fail: {ne}")
 
