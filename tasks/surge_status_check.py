@@ -2,10 +2,15 @@
 Surge Status Check
 ==================
 Lightweight Surge probe used by the Client HQ hourly auto-heal cron
-(/api/cron/check-surge-blocks → this agent's /admin/surge-status endpoint).
+(/api/cron/check-surge-blocks -> this agent's /ops/surge-status endpoint).
 
-Spawns a fresh headless Chrome (keep_alive=False), logs in via raw DOM fill
-(no LLM calls — this runs hourly and API cost must be zero), and reports:
+Spawns a fresh headless Chromium via Playwright directly (NOT Browser Use).
+Browser Use is an LLM-driven agent layer designed around an Agent/Task loop,
+and its Page handle is only populated after the Agent opens a page. Since
+this probe has zero LLM work to do (it just fills a login form and reads
+the dashboard), Playwright is both simpler and more deterministic.
+
+Contract:
 
     {
       "maintenance_active": bool,
@@ -16,7 +21,7 @@ Spawns a fresh headless Chrome (keep_alive=False), logs in via raw DOM fill
     }
 
 Runs OUTSIDE the audit asyncio lock so a long-running entity audit does not
-block status probes. Never raises — all errors surface through the `error`
+block status probes. Never raises - all errors surface through the `error`
 field so the caller (cron) can make policy decisions without try/except.
 """
 
@@ -25,9 +30,9 @@ import logging
 import os
 import re
 import time
-from typing import Optional
+from typing import Any
 
-from browser_use import Browser
+from playwright.async_api import async_playwright
 
 logger = logging.getLogger("agent.surge_status")
 
@@ -59,7 +64,7 @@ async def check_surge_status(timeout_seconds: int = 60) -> dict:
 
     Args:
         timeout_seconds: outer deadline in seconds. 60 is plenty for a fresh
-                         Playwright spawn + DOM fill + login redirect.
+                         browser spawn + DOM fill + login redirect.
 
     Returns:
         dict (never raises):
@@ -70,7 +75,7 @@ async def check_surge_status(timeout_seconds: int = 60) -> dict:
           error               str | None   (non-null if something went wrong)
     """
     start = time.time()
-    result = {
+    result: dict[str, Any] = {
         "maintenance_active": False,
         "credits": None,
         "logged_in": False,
@@ -83,35 +88,44 @@ async def check_surge_status(timeout_seconds: int = 60) -> dict:
         result["duration_seconds"] = round(time.time() - start, 2)
         return result
 
-    browser: Optional[Browser] = None
     try:
-        browser = Browser(
-            keep_alive=False,
+        await asyncio.wait_for(_probe(result), timeout=timeout_seconds)
+    except asyncio.TimeoutError:
+        result["error"] = f"Surge status probe timed out after {timeout_seconds}s"
+    except Exception as e:
+        result["error"] = f"Surge status probe failed: {e}"
+        logger.warning(f"check_surge_status error: {e}")
+
+    result["duration_seconds"] = round(time.time() - start, 2)
+    logger.info(
+        f"Surge status probe: logged_in={result['logged_in']} "
+        f"maintenance={result['maintenance_active']} credits={result['credits']} "
+        f"duration={result['duration_seconds']}s error={result['error']}"
+    )
+    return result
+
+
+async def _probe(result: dict) -> None:
+    """Inner probe - writes into `result` in place. May raise; wrapped by caller."""
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(
             headless=True,
-            disable_security=True,
             args=[
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
                 "--disable-gpu",
             ],
         )
+        try:
+            context = await browser.new_context()
+            page = await context.new_page()
 
-        async def _probe():
-            # Create the underlying browser + navigate. Browser Use 0.12.x
-            # implicitly starts the browser on first navigation when we use
-            # get_current_page after a direct page open; we drive navigation
-            # via evaluate() since we are not using the Agent here.
-            page = await browser.get_current_page()
-            if page is None:
-                raise RuntimeError("Browser did not produce a page handle")
-
-            # Navigate to Surge root and wait for it to settle
-            await page.navigate(SURGE_URL)
+            await page.goto(SURGE_URL, wait_until="domcontentloaded", timeout=20000)
             try:
-                await page.wait_for_load_state("networkidle", timeout=15000)
+                await page.wait_for_load_state("networkidle", timeout=10000)
             except Exception:
-                # networkidle can fail on long-running analytics; the dom
-                # fill below tolerates a partially-loaded page.
+                # networkidle can fail on long-running analytics; the DOM fill
+                # below tolerates a partially-loaded page.
                 pass
 
             # Fill email + password via DOM evaluate. Dispatch input + change
@@ -137,8 +151,8 @@ async def check_surge_status(timeout_seconds: int = 60) -> dict:
             if not filled or not filled.get("found"):
                 raise RuntimeError("Login form inputs not found on Surge landing page")
 
-            # Submit: try the enclosing form first, else dispatch Enter on
-            # the password field. Surge's React login handles both paths.
+            # Submit: try the enclosing form first, else the submit button,
+            # else dispatch Enter on the password field.
             await page.evaluate(
                 """() => {
                     const pwd = document.querySelector('input[type=password],input[name=password]');
@@ -159,7 +173,7 @@ async def check_surge_status(timeout_seconds: int = 60) -> dict:
             content = ""
             while time.time() < deadline:
                 try:
-                    current_url = await page.get_url()
+                    current_url = page.url
                 except Exception:
                     current_url = ""
                 try:
@@ -179,12 +193,14 @@ async def check_surge_status(timeout_seconds: int = 60) -> dict:
                 await asyncio.sleep(1)
 
             if not result["logged_in"]:
-                # Still try to classify — Surge sometimes shows the
+                # Still try to classify - Surge sometimes shows the
                 # maintenance banner BEFORE full login, which is an
                 # important signal even without a logged-in dashboard.
                 if content and any(s in content.lower() for s in MAINTENANCE_SIGNALS):
                     result["maintenance_active"] = True
-                    result["error"] = "Did not reach logged-in state (maintenance banner detected)"
+                    result["error"] = (
+                        "Did not reach logged-in state (maintenance banner detected)"
+                    )
                 else:
                     result["error"] = "Login did not complete within 25s"
                 return
@@ -210,25 +226,8 @@ async def check_surge_status(timeout_seconds: int = 60) -> dict:
                     except (ValueError, IndexError):
                         pass
                     break
-
-        await asyncio.wait_for(_probe(), timeout=timeout_seconds)
-
-    except asyncio.TimeoutError:
-        result["error"] = f"Surge status probe timed out after {timeout_seconds}s"
-    except Exception as e:
-        result["error"] = f"Surge status probe failed: {e}"
-        logger.warning(f"check_surge_status error: {e}")
-    finally:
-        if browser is not None:
+        finally:
             try:
                 await browser.close()
             except Exception:
                 pass
-
-    result["duration_seconds"] = round(time.time() - start, 2)
-    logger.info(
-        f"Surge status probe: logged_in={result['logged_in']} "
-        f"maintenance={result['maintenance_active']} credits={result['credits']} "
-        f"duration={result['duration_seconds']}s error={result['error']}"
-    )
-    return result
