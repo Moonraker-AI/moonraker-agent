@@ -246,13 +246,41 @@ async def _probe(result: dict) -> None:
                     result["error"] = "Login did not complete within 25s"
                 return
 
-            # Final innerText read for classification
-            try:
-                content = await page.evaluate(
-                    "() => document.body ? document.body.innerText : ''"
-                ) or ""
-            except Exception:
-                pass
+            # Post-login settling: the React dashboard hydrates in stages.
+            # A read immediately after URL change can miss the maintenance
+            # banner AND the credit counter. Poll until we see either a
+            # credit count OR a maintenance signal, for up to 8s, so the
+            # final classification read catches a fully-rendered page.
+            settle_deadline = time.time() + 8
+            classify_ready = False
+            while time.time() < settle_deadline:
+                try:
+                    content = await page.evaluate(
+                        "() => document.body ? document.body.innerText : ''"
+                    ) or ""
+                except Exception:
+                    content = ""
+                lowered = content.lower()
+                has_credits = any(
+                    re.search(pat, content, re.IGNORECASE) for pat in CREDITS_PATTERNS
+                )
+                has_maint = any(s in lowered for s in MAINTENANCE_SIGNALS)
+                if has_credits or has_maint:
+                    classify_ready = True
+                    break
+                await asyncio.sleep(0.5)
+
+            if not classify_ready:
+                # Still do one final read so `content` reflects the latest
+                # DOM state even if neither signal rendered (e.g. Surge UI
+                # changed layout or moved the credit counter behind a
+                # widget we don't scan).
+                try:
+                    content = await page.evaluate(
+                        "() => document.body ? document.body.innerText : ''"
+                    ) or ""
+                except Exception:
+                    pass
 
             content_lower = content.lower()
             result["maintenance_active"] = any(
