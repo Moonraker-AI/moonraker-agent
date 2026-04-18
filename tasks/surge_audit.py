@@ -24,6 +24,9 @@ import httpx
 from browser_use import Agent, Browser
 from browser_use.llm import ChatAnthropic
 
+from utils.debug_capture import capture_debug
+from utils.supabase_patch import patch_audit_terminal
+
 logger = logging.getLogger("agent.surge")
 
 # ── Config ───────────────────────────────────────────────────────────────────
@@ -41,6 +44,59 @@ SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
 POLL_INTERVAL_SECONDS = 30       # Check every 30s during Surge processing
 MAX_WAIT_MINUTES = 60            # Give up after 60 minutes
 FORM_FILL_TIMEOUT_SECONDS = 120  # Max time for login + form fill phase
+
+
+# ── Terminal failure helper ──────────────────────────────────────────────────
+
+async def _terminal_fail(
+    task_id,
+    update_task,
+    audit_id,
+    practice_name,
+    client_slug,
+    page,
+    status_code,
+    user_message,
+    error_detail,
+    notify_fn,
+):
+    """Handle a terminal non-retriable failure for an audit.
+
+    Five steps, each step best-effort so a downstream error doesn't mask the
+    primary failure reason:
+      1. capture_debug — save HTML + screenshot + innerText to /tmp/agent-debug/
+      2. patch_audit_terminal — flip Supabase to agent_error + retriable=false
+      3. update_task — set agent-local task state so Client HQ polling reads it
+      4. notify_fn — send the branded team email with the debug path included
+      5. return (do not raise) so the caller can proceed to `finally` cleanup
+
+    Note: status_code is agent-local only (e.g. 'surge_maintenance'). Supabase
+    gets 'agent_error' with the status_code preserved in last_agent_error.
+    """
+    # 1. Debug capture — best-effort, returns '' on failure
+    debug_path = ""
+    try:
+        debug_path = await capture_debug(task_id, page, status_code)
+    except Exception as ce:
+        logger.warning(f"Debug capture failed in _terminal_fail: {ce}")
+
+    # 2. Supabase terminal PATCH — best-effort, returns False on failure
+    try:
+        await patch_audit_terminal(audit_id, status_code, error_detail)
+    except Exception as pe:
+        logger.warning(f"Supabase PATCH failed in _terminal_fail: {pe}")
+
+    # 3. Agent-local task state
+    try:
+        update_task(task_id, status_code, user_message, error=error_detail)
+    except Exception as ue:
+        logger.warning(f"update_task failed in _terminal_fail: {ue}")
+
+    # 4. Team email notification
+    try:
+        await notify_fn(practice_name, client_slug, debug_path)
+    except Exception as ne:
+        logger.warning(f"Notification failed in _terminal_fail: {ne}")
 
 
 # ── Main entry point ─────────────────────────────────────────────────────────
@@ -126,19 +182,121 @@ async def execute_surge_audit(
 
         logger.info(f"Browser Use agent completed form fill phase for {practice_name}")
 
-        # ── Phase 2: Wait for Surge completion (Raw Playwright) ──────────
-        update_task(
-            task_id, "waiting_for_surge",
-            "Surge is processing the audit (typically 20 to 35 minutes)"
-        )
-
-        # Get the Playwright page from Browser Use's browser
+        # ── Phase 1.5: Post-submit verification ─────────────────────────
+        # Browser Use reports "submitted successfully" based on the optimistic
+        # UI Surge renders client-side on submit. That UI fires BEFORE the
+        # server accepts the job, so a server-side gate (maintenance mode,
+        # role check, rate limit) can silently drop the submission while the
+        # frontend still shows "Uses 1 credit · 236 remaining".
+        #
+        # This phase confirms the submission actually landed server-side
+        # before entering the 20-35min wait loop, turning silent rejection
+        # into a fast deterministic terminal failure instead of a 60-min
+        # timeout. On terminal failure, PATCH Supabase to
+        # agent_error+retriable=false so the cron does not auto-requeue.
         page = await browser.get_current_page()
         if not page:
             raise RuntimeError(
                 "Could not access Playwright page from Browser Use. "
                 "The browser may have closed unexpectedly."
             )
+
+        update_task(
+            task_id, "verifying_submission",
+            "Verifying Surge accepted the submission",
+        )
+
+        # Give Surge a moment to process the submit and navigate
+        await asyncio.sleep(5)
+
+        submit_confirmed = False
+        verification_error = None
+        try:
+            current_url = await page.get_url()
+            content_after = await page.evaluate(
+                "() => document.body ? document.body.innerText : ''"
+            )
+            content_lower_after = (content_after or "").lower()
+
+            # Signal 1 (strongest): URL changed to a run/analysis page
+            if "/dashboard/run/" in current_url or "/run/" in current_url:
+                submit_confirmed = True
+            else:
+                # Signal 2: optimistic UI processing indicators, then re-check
+                # URL after another few seconds to catch slow server redirects
+                processing_indicators = [
+                    "safe to close tab",
+                    "~20",
+                    "processing your audit",
+                    "queued for analysis",
+                ]
+                if any(ind in content_lower_after for ind in processing_indicators):
+                    await asyncio.sleep(10)
+                    later_url = await page.get_url()
+                    if "/dashboard/run/" in later_url or "/run/" in later_url:
+                        submit_confirmed = True
+                    elif later_url != current_url:
+                        # Some kind of navigation happened — trust it
+                        submit_confirmed = True
+
+            # If submit didn't confirm, check for a maintenance banner so we
+            # can fail with a precise reason rather than generic rejection.
+            if not submit_confirmed:
+                # Re-read content in case it updated
+                content_after = await page.evaluate(
+                    "() => document.body ? document.body.innerText : ''"
+                )
+                content_lower_after = (content_after or "").lower()
+                maintenance_signals = [
+                    "pushing system updates",
+                    "maintenance active",
+                    "new runs blocked",
+                ]
+                if any(sig in content_lower_after for sig in maintenance_signals):
+                    from utils.notifications import send_maintenance_notification
+                    await _terminal_fail(
+                        task_id, update_task, audit_id,
+                        practice_name, client_slug, page,
+                        "surge_maintenance",
+                        "Surge is in maintenance mode. New runs are blocked at the platform level.",
+                        "Surge maintenance mode active at submit time",
+                        send_maintenance_notification,
+                    )
+                    return
+
+                from utils.notifications import send_rejected_notification
+                await _terminal_fail(
+                    task_id, update_task, audit_id,
+                    practice_name, client_slug, page,
+                    "surge_rejected",
+                    "Surge did not accept the submission. The form submitted without producing a processing page.",
+                    f"Silent rejection: URL did not change to /run/ after submit (url={current_url})",
+                    send_rejected_notification,
+                )
+                return
+        except Exception as ve:
+            # If verification itself errors, log and fall through to the wait
+            # loop — better to wait 60 min and timeout than to falsely
+            # terminal-fail a legitimate audit on a transient DOM error.
+            verification_error = str(ve)
+            logger.warning(
+                f"Post-submit verification errored for {practice_name}, "
+                f"falling through to wait loop: {ve}"
+            )
+
+        if submit_confirmed:
+            logger.info(f"Post-submit verification passed for {practice_name}")
+        elif verification_error:
+            logger.info(
+                f"Post-submit verification skipped due to error "
+                f"({verification_error}); entering wait loop anyway"
+            )
+
+        # ── Phase 2: Wait for Surge completion (Raw Playwright) ──────────
+        update_task(
+            task_id, "waiting_for_surge",
+            "Surge is processing the audit (typically 20 to 35 minutes)"
+        )
 
         # Note: Browser Use 0.12.x Page wrapper doesn't expose Playwright's
         # context for clipboard permissions. Clipboard intercept in extraction
@@ -201,16 +359,12 @@ async def execute_surge_audit(
                 if "error" in content_lower and "analysis failed" in content_lower:
                     raise RuntimeError("Surge reported an analysis failure on the page")
 
-                # Check for credit exhaustion
-                if "insufficient credits" in content_lower or "no credits" in content_lower:
-                    update_task(
-                        task_id, "credits_exhausted",
-                        "Surge credits exhausted. Contact the Surge team to re-up.",
-                        error="Credits exhausted",
-                    )
-                    from utils.notifications import send_credits_notification
-                    await send_credits_notification(practice_name, client_slug)
-                    return
+                # NOTE: The pre-2026-04-18 code had a full-page substring match
+                # here for "insufficient credits" / "no credits" that false-
+                # positived on Surge's maintenance-mode banner. Removed: if the
+                # form submit landed (confirmed in Phase 1.5 above), credits
+                # were sufficient. Any failure during the wait loop is now
+                # surfaced as a timeout or an explicit "analysis failed" error.
 
                 # Log URL periodically for debugging
                 if elapsed_min % 5 == 0 and elapsed_min > 0:
@@ -289,6 +443,15 @@ async def execute_surge_audit(
 
     except Exception as e:
         logger.exception(f"Surge audit failed for {req.get('practice_name', 'unknown')}")
+        # Best-effort debug capture before re-raising so server.py still
+        # fires its normal error-notification path.
+        try:
+            if browser is not None:
+                dbg_page = await browser.get_current_page()
+                if dbg_page is not None:
+                    await capture_debug(task_id, dbg_page, "generic_exception")
+        except Exception as ce:
+            logger.warning(f"Debug capture in except block failed: {ce}")
         raise  # Re-raise so server.py handles notification
 
     finally:
@@ -449,3 +612,4 @@ async def _post_results_to_client_hq(audit_id: str, surge_data: str):
             )
 
         logger.info(f"Successfully posted audit results for audit_id={audit_id}")
+
