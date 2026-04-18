@@ -229,7 +229,7 @@ async def health():
     }
 
 
-@app.get("/admin/surge-status", dependencies=[Depends(verify_api_key)])
+@app.get("/ops/surge-status", dependencies=[Depends(verify_api_key)])
 async def surge_status():
     """Independent Surge probe used by Client HQ's hourly auto-heal cron.
 
@@ -238,6 +238,10 @@ async def surge_status():
     credit state. All error paths surface through the `error` field rather
     than raising, so the caller can make policy decisions without wrapping
     in try/except.
+
+    Exposed under /ops/* (not /admin/*) because Caddy routes /admin/* on
+    this host to the out-of-band admin service on port 8001. /ops/* falls
+    through to the agent container on port 8000.
     """
     return await check_surge_status(timeout_seconds=60)
 
