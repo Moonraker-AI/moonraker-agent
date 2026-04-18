@@ -105,6 +105,20 @@ async def check_surge_status(timeout_seconds: int = 60) -> dict:
     return result
 
 
+async def _login_form_present(page) -> bool:
+    """Return True when both an email and password input are in the DOM."""
+    try:
+        return bool(await page.evaluate(
+            """() => {
+                const e = document.querySelector('input[type=email],input[name=email],input[placeholder*="mail" i]');
+                const p = document.querySelector('input[type=password],input[name=password]');
+                return !!(e && p);
+            }"""
+        ))
+    except Exception:
+        return False
+
+
 async def _probe(result: dict) -> None:
     """Inner probe - writes into `result` in place. May raise; wrapped by caller."""
     async with async_playwright() as pw:
@@ -127,6 +141,33 @@ async def _probe(result: dict) -> None:
                 # networkidle can fail on long-running analytics; the DOM fill
                 # below tolerates a partially-loaded page.
                 pass
+
+            # SURGE_URL points at the marketing root (surgeaiprotocol.com),
+            # which has no form - the login lives behind a "Sign In" link
+            # at /sign-in. Click-through is more resilient than hardcoding
+            # the path, since the link text is UI-facing and stable.
+            if not await _login_form_present(page):
+                try:
+                    clicked = await page.evaluate(
+                        """() => {
+                            const els = Array.from(document.querySelectorAll('button,a'));
+                            const el = els.find(e => {
+                                const t = (e.innerText || '').trim().toLowerCase();
+                                return t === 'sign in' || t === 'log in' || t === 'login';
+                            });
+                            if (el) { el.click(); return true; }
+                            return false;
+                        }"""
+                    )
+                    if clicked:
+                        try:
+                            await page.wait_for_load_state("domcontentloaded", timeout=10000)
+                        except Exception:
+                            pass
+                        # Give React time to mount the form
+                        await asyncio.sleep(1.5)
+                except Exception as click_err:
+                    logger.warning(f"Sign-in click failed: {click_err}")
 
             # Fill email + password via DOM evaluate. Dispatch input + change
             # events so React controlled inputs sync their internal state.
