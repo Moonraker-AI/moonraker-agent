@@ -204,26 +204,111 @@ async def send_error_notification(
     )
 
 
-async def send_credits_notification(practice_name: str, client_slug: str):
-    """Notify team that Surge credits are exhausted."""
+def _debug_footer(debug_path: str) -> str:
+    """Render a small debug-path footer for team emails when evidence was captured."""
+    if not debug_path:
+        return ""
+    return f"""
+    <p style="font-family:Inter,sans-serif;font-size:12px;color:#6B7599;line-height:1.5;margin:16px 0 0;padding-top:12px;border-top:1px solid #E2E8F0;">
+      Debug evidence captured on the agent VPS at
+      <code style="font-family:ui-monospace,Menlo,monospace;color:#1E2A5E;">{_esc(debug_path)}</code>
+    </p>"""
+
+
+async def send_credits_notification(
+    practice_name: str,
+    client_slug: str,
+    debug_path: str = "",
+):
+    """Notify team that Surge credits are exhausted. This is a terminal non-retriable
+    state on the Supabase side (agent_error_retriable=false); admins must manually
+    requeue from Client HQ once credits are replenished."""
     body_html = f"""
     <p style="font-family:Inter,sans-serif;font-size:15px;color:#333F70;line-height:1.7;margin:0 0 16px;">
       The Surge audit for <strong>{_esc(practice_name)}</strong> could not run because
-      the account has insufficient credits. Contact the Surge team to add more credits.
+      the Surge account has insufficient credits. Contact the Surge team to add more credits.
     </p>
-    <p style="font-family:Inter,sans-serif;font-size:15px;color:#333F70;line-height:1.7;margin:0;">
-      Once credits are replenished, re-trigger the audit from Client HQ.
-    </p>"""
+    <p style="font-family:Inter,sans-serif;font-size:15px;color:#333F70;line-height:1.7;margin:0 0 16px;">
+      This audit will not auto-retry. Once credits are replenished, open the client in
+      Client HQ and manually requeue from the Audit tab.
+    </p>
+    {_debug_footer(debug_path)}"""
 
     html = _build_email_html(
         title="Surge Credits Exhausted",
-        subtitle="Audits paused until credits are replenished",
+        subtitle="Audit paused, manual requeue required",
         body_html=body_html,
         header_label="Credits Alert",
     )
 
     await _send_email(
         subject=f"Surge Credits Exhausted (attempted: {practice_name})",
+        html=html,
+    )
+
+
+async def send_maintenance_notification(
+    practice_name: str,
+    client_slug: str,
+    debug_path: str = "",
+):
+    """Notify team that Surge is in maintenance mode and blocked the submission.
+    Terminal non-retriable state on Supabase."""
+    body_html = f"""
+    <p style="font-family:Inter,sans-serif;font-size:15px;color:#333F70;line-height:1.7;margin:0 0 16px;">
+      The Surge audit for <strong>{_esc(practice_name)}</strong> could not run because
+      Surge is currently in maintenance mode. New runs are being blocked at the Surge
+      platform level.
+    </p>
+    <p style="font-family:Inter,sans-serif;font-size:15px;color:#333F70;line-height:1.7;margin:0 0 16px;">
+      This audit will not auto-retry. Once Surge maintenance mode is disabled, open the
+      client in Client HQ and manually requeue from the Audit tab.
+    </p>
+    {_debug_footer(debug_path)}"""
+
+    html = _build_email_html(
+        title="Surge Maintenance Active",
+        subtitle="Audit paused, manual requeue required once Surge is back",
+        body_html=body_html,
+        header_label="Maintenance Alert",
+    )
+
+    await _send_email(
+        subject=f"Surge Maintenance Blocked Audit (attempted: {practice_name})",
+        html=html,
+    )
+
+
+async def send_rejected_notification(
+    practice_name: str,
+    client_slug: str,
+    debug_path: str = "",
+):
+    """Notify team that Surge silently rejected the submission post-form-fill.
+    This usually means a server-side gate (maintenance, role check, rate limit)
+    dropped the job after the frontend optimistically displayed success.
+    Terminal non-retriable state on Supabase."""
+    body_html = f"""
+    <p style="font-family:Inter,sans-serif;font-size:15px;color:#333F70;line-height:1.7;margin:0 0 16px;">
+      The Surge audit for <strong>{_esc(practice_name)}</strong> was submitted but
+      Surge did not acknowledge the submission. The form filled cleanly, but the
+      expected processing page never loaded, suggesting a silent server-side rejection.
+    </p>
+    <p style="font-family:Inter,sans-serif;font-size:15px;color:#333F70;line-height:1.7;margin:0 0 16px;">
+      This audit will not auto-retry. Review the debug capture below for the exact
+      page state, then manually requeue from Client HQ after addressing the root cause.
+    </p>
+    {_debug_footer(debug_path)}"""
+
+    html = _build_email_html(
+        title="Surge Submission Rejected",
+        subtitle="No processing page after form submit — manual intervention required",
+        body_html=body_html,
+        header_label="Submission Alert",
+    )
+
+    await _send_email(
+        subject=f"Surge Rejected Submission (attempted: {practice_name})",
         html=html,
     )
 
@@ -267,3 +352,4 @@ async def send_batch_notification(
         subject=f"Batch Audit Complete: {brand_name} ({pages_extracted}/{pages_total} pages)",
         html=html,
     )
+
