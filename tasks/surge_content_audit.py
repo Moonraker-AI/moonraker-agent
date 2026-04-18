@@ -17,6 +17,8 @@ from datetime import datetime
 
 import httpx
 
+from utils.debug_capture import capture_debug
+
 logger = logging.getLogger("moonraker.surge_content_audit")
 
 
@@ -308,6 +310,15 @@ stop and confirm the analysis is running.
 
     except Exception as e:
         logger.exception(f"Content audit error: {e}")
+        # Best-effort debug capture so future investigations have HTML + screenshot
+        # instead of just logs. Non-fatal: log and continue if capture fails.
+        try:
+            if browser is not None:
+                dbg_page = await browser.get_current_page()
+                if dbg_page is not None:
+                    await capture_debug(task_id, dbg_page, "content_audit_exception")
+        except Exception as ce:
+            logger.warning(f"Debug capture in content audit except block failed: {ce}")
         await status_callback(task_id, "failed", f"Error: {str(e)[:200]}")
 
     finally:
@@ -324,3 +335,4 @@ stop and confirm the analysis is running.
         except Exception as cleanup_err:
             import logging
             logging.getLogger("agent.cleanup").warning(f"Cleanup failed: {cleanup_err}")
+
