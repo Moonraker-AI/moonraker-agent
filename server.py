@@ -32,6 +32,7 @@ from tasks.apply_neo_overlay import run_apply_neo_overlay
 from tasks.wp_scout import run_wp_scout
 from tasks.sq_scout import run_sq_scout
 from tasks.wix_scout import run_wix_scout
+from tasks.surge_status_check import check_surge_status
 
 load_dotenv()
 
@@ -205,9 +206,19 @@ def update_task(task_id: str, status: str, message: str, error: str = None):
 
 @app.get("/health", dependencies=[Depends(verify_api_key)])
 async def health():
+    # Terminal states that do NOT count against active_tasks. Kept in sync
+    # with the status codes the agent emits in terminal-failure paths:
+    # complete/error for normal endings, credits_exhausted/surge_maintenance/
+    # surge_rejected for Phase 1.5 + retriable=false failures.
     active_tasks = sum(
         1 for t in tasks.values()
-        if t["status"] not in ("complete", "error", "credits_exhausted")
+        if t["status"] not in (
+            "complete",
+            "error",
+            "credits_exhausted",
+            "surge_maintenance",
+            "surge_rejected",
+        )
     )
     return {
         "status": "ok",
@@ -216,6 +227,19 @@ async def health():
         "active_tasks": active_tasks,
         "total_tasks": len(tasks),
     }
+
+
+@app.get("/admin/surge-status", dependencies=[Depends(verify_api_key)])
+async def surge_status():
+    """Independent Surge probe used by Client HQ's hourly auto-heal cron.
+
+    Spawns a throwaway headless browser (does NOT acquire the audit lock),
+    logs in via raw DOM fill (zero LLM calls), and reports maintenance +
+    credit state. All error paths surface through the `error` field rather
+    than raising, so the caller can make policy decisions without wrapping
+    in try/except.
+    """
+    return await check_surge_status(timeout_seconds=60)
 
 
 @app.post("/tasks/surge-audit", dependencies=[Depends(verify_api_key)])
