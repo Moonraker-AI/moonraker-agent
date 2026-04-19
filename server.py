@@ -23,7 +23,7 @@ from typing import Optional, List
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Depends, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, field_validator
 
 from tasks.surge_content_audit import run_surge_content_audit
 from tasks.surge_batch_audit import run_surge_batch_audit
@@ -107,6 +107,33 @@ LIGHT_TASK_COOLDOWN = 2
 
 # ── Models ───────────────────────────────────────────────────────────────────
 
+# URL + list validation helpers. Shared across every task request model so a
+# malformed URL is rejected at 422 before any task is queued — prevents SSRF
+# probes like `file:///etc/passwd` or `http://169.254.169.254/...` from
+# reaching Browser Use / Playwright with agent-side privileges. Bearer auth
+# is still the primary control; this is defence in depth.
+
+MAX_URL_LEN = 2048
+MAX_TEXT_LEN = 4096
+MAX_BATCH_PAGES = 100
+
+
+def _validate_http_url(v: str) -> str:
+    if not isinstance(v, str) or not v:
+        raise ValueError("URL must be a non-empty string")
+    if not v.lower().startswith(("http://", "https://")):
+        raise ValueError("URL must start with http:// or https://")
+    if len(v) > MAX_URL_LEN:
+        raise ValueError(f"URL too long (max {MAX_URL_LEN} chars)")
+    return v
+
+
+def _validate_optional_http_url(v):
+    if v is None or v == "":
+        return v
+    return _validate_http_url(v)
+
+
 class SurgeAuditRequest(BaseModel):
     audit_id: str
     practice_name: str
@@ -117,25 +144,8 @@ class SurgeAuditRequest(BaseModel):
     gbp_link: Optional[str] = None
     client_slug: str
 
-    @field_validator("website_url")
-    @classmethod
-    def _must_be_http_url(cls, v: str) -> str:
-        if not v or not v.lower().startswith(("http://", "https://")):
-            raise ValueError("website_url must start with http:// or https://")
-        if len(v) > 2048:
-            raise ValueError("website_url too long")
-        return v
-
-    @field_validator("gbp_link")
-    @classmethod
-    def _gbp_must_be_url(cls, v: Optional[str]) -> Optional[str]:
-        if v is None or v == "":
-            return v
-        if not v.lower().startswith(("http://", "https://")):
-            raise ValueError("gbp_link must start with http:// or https://")
-        if len(v) > 2048:
-            raise ValueError("gbp_link too long")
-        return v
+    _v_website = field_validator("website_url")(classmethod(lambda cls, v: _validate_http_url(v)))
+    _v_gbp = field_validator("gbp_link")(classmethod(lambda cls, v: _validate_optional_http_url(v)))
 
 class SurgeContentAuditRequest(BaseModel):
     content_page_id: str
@@ -150,10 +160,15 @@ class SurgeContentAuditRequest(BaseModel):
     client_slug: Optional[str] = None
     callback_url: Optional[str] = None
 
+    _v_website = field_validator("website_url")(classmethod(lambda cls, v: _validate_http_url(v)))
+    _v_callback = field_validator("callback_url")(classmethod(lambda cls, v: _validate_optional_http_url(v)))
+
 class BatchPageItem(BaseModel):
     content_page_id: str
     keyword: str
     target_url: str
+
+    _v_target = field_validator("target_url")(classmethod(lambda cls, v: _validate_http_url(v)))
 
 class SurgeBatchAuditRequest(BaseModel):
     batch_id: str
@@ -163,8 +178,12 @@ class SurgeBatchAuditRequest(BaseModel):
     entity_type: Optional[str] = "Local Business"
     geo_target: Optional[str] = None
     website_url: Optional[str] = None
-    pages: List[BatchPageItem]
+    pages: List[BatchPageItem] = Field(..., max_length=MAX_BATCH_PAGES)
     callback_url: Optional[str] = None
+
+    _v_gbp = field_validator("gbp_url")(classmethod(lambda cls, v: _validate_http_url(v)))
+    _v_website = field_validator("website_url")(classmethod(lambda cls, v: _validate_optional_http_url(v)))
+    _v_callback = field_validator("callback_url")(classmethod(lambda cls, v: _validate_optional_http_url(v)))
 
 class CaptureDesignAssetsRequest(BaseModel):
     design_spec_id: str
@@ -173,6 +192,11 @@ class CaptureDesignAssetsRequest(BaseModel):
     service_page_url: Optional[str] = None
     about_page_url: Optional[str] = None
     callback_url: Optional[str] = None
+
+    _v_website = field_validator("website_url")(classmethod(lambda cls, v: _validate_http_url(v)))
+    _v_service = field_validator("service_page_url")(classmethod(lambda cls, v: _validate_optional_http_url(v)))
+    _v_about = field_validator("about_page_url")(classmethod(lambda cls, v: _validate_optional_http_url(v)))
+    _v_callback = field_validator("callback_url")(classmethod(lambda cls, v: _validate_optional_http_url(v)))
 
 class NeoOverlayRequest(BaseModel):
     base_image_url: str
@@ -186,6 +210,11 @@ class NeoOverlayRequest(BaseModel):
     neo_image_id: Optional[str] = None
     callback_url: Optional[str] = None
 
+    _v_base = field_validator("base_image_url")(classmethod(lambda cls, v: _validate_http_url(v)))
+    _v_logo = field_validator("logo_url")(classmethod(lambda cls, v: _validate_optional_http_url(v)))
+    _v_gbp = field_validator("gbp_share_link")(classmethod(lambda cls, v: _validate_optional_http_url(v)))
+    _v_callback = field_validator("callback_url")(classmethod(lambda cls, v: _validate_optional_http_url(v)))
+
 
 class WpScoutRequest(BaseModel):
     wp_admin_url: str
@@ -193,6 +222,10 @@ class WpScoutRequest(BaseModel):
     wp_password: str
     client_slug: Optional[str] = None
     callback_url: Optional[str] = None
+
+    _v_admin = field_validator("wp_admin_url")(classmethod(lambda cls, v: _validate_http_url(v)))
+    _v_callback = field_validator("callback_url")(classmethod(lambda cls, v: _validate_optional_http_url(v)))
+
 
 class SqScoutRequest(BaseModel):
     website_url: str
@@ -202,10 +235,17 @@ class SqScoutRequest(BaseModel):
     sq_site_id: Optional[str] = None
     callback_url: Optional[str] = None
 
+    _v_website = field_validator("website_url")(classmethod(lambda cls, v: _validate_http_url(v)))
+    _v_callback = field_validator("callback_url")(classmethod(lambda cls, v: _validate_optional_http_url(v)))
+
+
 class WixScoutRequest(BaseModel):
     website_url: str
     client_slug: Optional[str] = None
     callback_url: Optional[str] = None
+
+    _v_website = field_validator("website_url")(classmethod(lambda cls, v: _validate_http_url(v)))
+    _v_callback = field_validator("callback_url")(classmethod(lambda cls, v: _validate_optional_http_url(v)))
 class TaskStatusResponse(BaseModel):
     task_id: str
     status: str
