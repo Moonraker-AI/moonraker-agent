@@ -69,15 +69,30 @@ async def capture_debug(task_id: str, page, reason: str, extra: dict = None) -> 
         except Exception as e:
             logger.warning(f"capture_debug: could not save innerText: {e}")
 
-        # Screenshot — Browser Use 0.12.x exposes take_screenshot on the Page
-        # wrapper; fall back to Playwright's .screenshot() if that signature
-        # isn't available. Either path is best-effort.
+        # Screenshot — Browser Use 0.12.x's Page wrapper does NOT accept a
+        # `path=` kwarg (breaks with: Page.screenshot() got an unexpected
+        # keyword argument 'path'). Both take_screenshot() and screenshot()
+        # on the wrapper return raw bytes (or base64 in some versions), so
+        # grab the return value and write it ourselves.
         shot_path = capture_dir / f"{prefix}.png"
         try:
+            data = None
             if hasattr(page, "take_screenshot"):
-                await page.take_screenshot(path=str(shot_path))
+                data = await page.take_screenshot()
             elif hasattr(page, "screenshot"):
-                await page.screenshot(path=str(shot_path))
+                data = await page.screenshot()
+
+            if data:
+                if isinstance(data, str):
+                    # Some Browser Use paths return base64-encoded PNGs
+                    import base64
+                    try:
+                        data = base64.b64decode(data)
+                    except Exception:
+                        # Not base64 — treat as already-decoded text and skip
+                        data = None
+                if isinstance(data, (bytes, bytearray)):
+                    shot_path.write_bytes(bytes(data))
         except Exception as e:
             logger.warning(f"capture_debug: could not save screenshot: {e}")
 

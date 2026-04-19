@@ -23,7 +23,7 @@ from typing import Optional, List
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Depends, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 from tasks.surge_content_audit import run_surge_content_audit
 from tasks.surge_batch_audit import run_surge_batch_audit
@@ -42,7 +42,21 @@ logging.basicConfig(
 )
 logger = logging.getLogger("agent")
 
-app = FastAPI(title="Moonraker Agent Service", version="0.4.0", docs_url=None, redoc_url=None, openapi_url=None)
+# Install secret redaction filter ASAP so no subsequent import can log a raw
+# secret. Scrubs SURGE_PASSWORD, API keys, bearer tokens, etc. from all log
+# records. See utils/log_redact.py for scope and residual risk.
+from utils.log_redact import install as _install_log_redact
+_install_log_redact()
+
+AGENT_VERSION = "0.6.0"
+
+app = FastAPI(
+    title="Moonraker Agent Service",
+    version=AGENT_VERSION,
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -102,6 +116,26 @@ class SurgeAuditRequest(BaseModel):
     geo_target: Optional[str] = None
     gbp_link: Optional[str] = None
     client_slug: str
+
+    @field_validator("website_url")
+    @classmethod
+    def _must_be_http_url(cls, v: str) -> str:
+        if not v or not v.lower().startswith(("http://", "https://")):
+            raise ValueError("website_url must start with http:// or https://")
+        if len(v) > 2048:
+            raise ValueError("website_url too long")
+        return v
+
+    @field_validator("gbp_link")
+    @classmethod
+    def _gbp_must_be_url(cls, v: Optional[str]) -> Optional[str]:
+        if v is None or v == "":
+            return v
+        if not v.lower().startswith(("http://", "https://")):
+            raise ValueError("gbp_link must start with http:// or https://")
+        if len(v) > 2048:
+            raise ValueError("gbp_link too long")
+        return v
 
 class SurgeContentAuditRequest(BaseModel):
     content_page_id: str
@@ -204,12 +238,22 @@ def update_task(task_id: str, status: str, message: str, error: str = None):
 
 # ── Routes ───────────────────────────────────────────────────────────────────
 
+@app.get("/healthz")
+async def healthz():
+    """Unauthenticated liveness probe for Docker HEALTHCHECK.
+    Returns minimal state only — no task counts, no version disclosure.
+    Container port is bound to 127.0.0.1 on the host so this endpoint is
+    not reachable from the public internet (Caddy does not proxy /healthz)."""
+    return {"status": "ok"}
+
+
 @app.get("/health", dependencies=[Depends(verify_api_key)])
 async def health():
     # Terminal states that do NOT count against active_tasks. Kept in sync
     # with the status codes the agent emits in terminal-failure paths:
-    # complete/error for normal endings, credits_exhausted/surge_maintenance/
-    # surge_rejected for Phase 1.5 + retriable=false failures.
+    # complete/error for normal endings; credits_exhausted, surge_maintenance,
+    # surge_rejected, and target_blocked for Phase 1.5 + retriable=false
+    # failures (target_blocked = target site's WAF refused Surge's crawl).
     active_tasks = sum(
         1 for t in tasks.values()
         if t["status"] not in (
@@ -218,12 +262,13 @@ async def health():
             "credits_exhausted",
             "surge_maintenance",
             "surge_rejected",
+            "target_blocked",
         )
     )
     return {
         "status": "ok",
         "service": "moonraker-agent",
-        "version": "0.4.0",
+        "version": AGENT_VERSION,
         "active_tasks": active_tasks,
         "total_tasks": len(tasks),
     }

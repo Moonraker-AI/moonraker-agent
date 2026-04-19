@@ -29,6 +29,21 @@ from utils.supabase_patch import patch_audit_terminal, should_suppress_notificat
 
 logger = logging.getLogger("agent.surge")
 
+# Substrings (lowercased) indicating Surge accepted our submit but its own
+# downstream crawl of the target URL was blocked by a WAF/firewall. Different
+# root cause than surge_rejected (server-side gate on Surge's end) — the work
+# to unblock lives on the client site, not on Surge or us. Matched against
+# document.body.innerText on the post-submit page.
+TARGET_BLOCKED_SIGNALS = [
+    "silently blocking us",
+    "appears to be blocking",
+    "could not be reached",
+    "target url could not be reached",
+    "unable to reach the target",
+    "failed to fetch the target",
+    "blocked by the target site",
+]
+
 # ── Config ───────────────────────────────────────────────────────────────────
 
 SURGE_URL = os.getenv("SURGE_URL", "https://www.surgeaiprotocol.com")
@@ -160,7 +175,17 @@ async def execute_surge_audit(
             timeout=120,
         )
 
-        # Build the form fill task prompt
+        # Build the form fill task prompt.
+        #
+        # Credentials remain interpolated here for now (reverting this adds
+        # Browser-Use-API-level complexity — an independent Playwright login
+        # with CDP handoff to Browser Use — that needs its own test cycle).
+        # Leakage mitigations currently in place:
+        #  1. Log redaction filter (utils.log_redact) scrubs SURGE_PASSWORD
+        #     and other env secrets from all stdout log records before they
+        #     land in docker json-file logs.
+        #  2. TODO: full refactor to pre-login via raw Playwright + CDP
+        #     handoff will eliminate the Anthropic API exposure too.
         geo_target = geo_target_override or (f"{city}, {state}" if city and state else city or state or "")
         gbp_instruction = ""
         if gbp_link:
@@ -253,8 +278,9 @@ async def execute_surge_audit(
                         # Some kind of navigation happened — trust it
                         submit_confirmed = True
 
-            # If submit didn't confirm, check for a maintenance banner so we
-            # can fail with a precise reason rather than generic rejection.
+            # If submit didn't confirm, classify precisely: maintenance first
+            # (Surge platform down), then target_blocked (target site WAF
+            # refusing Surge's downstream crawl), then generic surge_rejected.
             if not submit_confirmed:
                 # Re-read content in case it updated
                 content_after = await page.evaluate(
@@ -275,6 +301,29 @@ async def execute_surge_audit(
                         "Surge is in maintenance mode. New runs are blocked at the platform level.",
                         "Surge maintenance mode active at submit time",
                         send_maintenance_notification,
+                    )
+                    return
+
+                # target_blocked: Surge tried to fetch the target URL and the
+                # target's WAF refused. This is a client-site issue, not a
+                # Surge or agent issue — surface the target URL so the team
+                # can investigate Cloudflare/firewall settings for that site.
+                matched_blocking_signal = next(
+                    (sig for sig in TARGET_BLOCKED_SIGNALS if sig in content_lower_after),
+                    None,
+                )
+                if matched_blocking_signal:
+                    from utils.notifications import send_rejected_notification
+                    await _terminal_fail(
+                        task_id, update_task, audit_id,
+                        practice_name, client_slug, page,
+                        "target_blocked",
+                        "Surge could not crawl the target URL. The site's WAF or firewall blocked the request.",
+                        (
+                            f"Target WAF block: Surge reported '{matched_blocking_signal}' "
+                            f"for target={website_url} (post-submit url={current_url})"
+                        ),
+                        send_rejected_notification,
                     )
                     return
 
