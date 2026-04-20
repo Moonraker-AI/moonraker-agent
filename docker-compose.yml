@@ -13,6 +13,12 @@ services:
     memswap_limit: 5g
     volumes:
       - agent-data:/app/data
+      # Persistent Chromium profiles for SQSP/WP admin flows, keyed on
+      # workspace_credentials.id. Backed up nightly to Hetzner Storage Box
+      # via /usr/local/bin/backup-profiles.sh (runs as root on host).
+      # Host dir /data/profiles must be owned by uid 1000 (appuser) so the
+      # non-root container can write persistent context data.
+      - /data/profiles:/data/profiles
     logging:
       driver: "json-file"
       options:

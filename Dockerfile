@@ -34,6 +34,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 RUN playwright install chromium
 RUN playwright install-deps chromium
 
+# Install Patchright chromium (stealth-patched driver, for SQSP/WP admin flows).
+# Respects PLAYWRIGHT_BROWSERS_PATH so it shares /ms-playwright with vanilla
+# Playwright. Surge audits and other public-page flows stay on vanilla.
+RUN patchright install chromium
+
 COPY . .
 
 # Create non-root user and hand ownership of app + browser cache + debug dir.
