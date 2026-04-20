@@ -15,6 +15,7 @@ Architecture:
 import asyncio
 import logging
 import os
+import re
 import secrets
 import uuid
 from datetime import datetime, timezone
@@ -134,6 +135,19 @@ def _validate_optional_http_url(v):
     return _validate_http_url(v)
 
 
+# Mirrors utils/browser.py::_CREDENTIAL_ID_RE so malformed IDs are rejected at
+# the API boundary, not at launch time. Accepts UUIDs, slugs, hex digests.
+_CREDENTIAL_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def _validate_optional_credential_id(v):
+    if v is None or v == "":
+        return None
+    if not isinstance(v, str) or not _CREDENTIAL_ID_RE.match(v):
+        raise ValueError("credential_id must match ^[A-Za-z0-9_-]{1,64}$")
+    return v
+
+
 class SurgeAuditRequest(BaseModel):
     audit_id: str
     practice_name: str
@@ -222,9 +236,15 @@ class WpScoutRequest(BaseModel):
     wp_password: str
     client_slug: Optional[str] = None
     callback_url: Optional[str] = None
+    # When set, the browser fallback uses Patchright + a persistent
+    # Chromium profile rooted at /data/profiles/<credential_id>. Reuses
+    # cookies/sessions across runs so repeated scouts do not trigger
+    # "unusual login" emails. Absent -> legacy ephemeral Playwright.
+    credential_id: Optional[str] = None
 
     _v_admin = field_validator("wp_admin_url")(classmethod(lambda cls, v: _validate_http_url(v)))
     _v_callback = field_validator("callback_url")(classmethod(lambda cls, v: _validate_optional_http_url(v)))
+    _v_credential = field_validator("credential_id")(classmethod(lambda cls, v: _validate_optional_credential_id(v)))
 
 
 class SqScoutRequest(BaseModel):

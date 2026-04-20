@@ -34,12 +34,17 @@ async def run_wp_scout(task_id, params, status_callback, env):
         wp_password: str
         client_slug: str (optional)
         callback_url: str (optional)
+        credential_id: str (optional) - workspace_credentials.id. When set,
+            the browser fallback uses Patchright + a persistent Chromium
+            profile at /data/profiles/<credential_id> so repeated runs
+            reuse cookies/sessions. Absent -> legacy ephemeral Playwright.
     """
     wp_admin_url = params.get("wp_admin_url", "").rstrip("/")
     wp_username = params.get("wp_username", "")
     wp_password = params.get("wp_password", "")
     client_slug = params.get("client_slug", "")
     callback_url = params.get("callback_url", "")
+    credential_id = params.get("credential_id") or None
     agent_api_key = env.get("AGENT_API_KEY", "")
 
     if not all([wp_admin_url, wp_username, wp_password]):
@@ -95,7 +100,8 @@ async def run_wp_scout(task_id, params, status_callback, env):
 
     browser_success = await _try_browser(
         base_url, wp_admin_url, wp_username, wp_password,
-        report, status_callback, task_id
+        report, status_callback, task_id,
+        credential_id=credential_id,
     )
 
     if browser_success:
@@ -353,35 +359,65 @@ async def _try_rest_api(base_url, username, password, report, status_callback, t
 
 # ── Browser fallback ─────────────────────────────────────────────────────
 
-async def _try_browser(base_url, wp_admin_url, username, password, report, status_callback, task_id):
+async def _try_browser(base_url, wp_admin_url, username, password, report, status_callback, task_id, credential_id=None):
     """Fall back to browser-based login and navigation."""
 
     login_url = f"{base_url}/wp-login.php"
     browser = None
+    context = None
     playwright_instance = None
 
     try:
-        playwright_instance = await async_playwright().start()
-        browser = await playwright_instance.chromium.launch(
-            headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-                "--disable-blink-features=AutomationControlled",
-            ],
-        )
-        context = await browser.new_context(
-            viewport={"width": 1440, "height": 900},
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-            locale="en-US",
-            timezone_id="America/New_York",
-        )
-        await context.add_init_script("""
-            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-            Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
-            window.chrome = {runtime: {}};
-        """)
+        if credential_id:
+            # Stealth + persistent profile path.
+            # Patchright's patched driver already removes webdriver,
+            # Runtime.enable, chrome, languages spoofs — no init script needed.
+            # Persistent context keeps cookies/localStorage/service workers across
+            # runs so repeated scouts reuse the login session.
+            from utils.browser import chromium_launch_args, profile_dir_for
+            from patchright.async_api import async_playwright as _patchright_async_playwright
+
+            logger.info(
+                f"wp_scout browser: Patchright + persistent profile "
+                f"(credential_id={credential_id})"
+            )
+            playwright_instance = await _patchright_async_playwright().start()
+            context = await playwright_instance.chromium.launch_persistent_context(
+                user_data_dir=profile_dir_for(credential_id),
+                viewport={"width": 1440, "height": 900},
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/131.0.0.0 Safari/537.36"
+                ),
+                locale="en-US",
+                timezone_id="America/New_York",
+                **chromium_launch_args(stealth=True),
+            )
+        else:
+            # Legacy ephemeral path — unchanged behaviour for callers that
+            # do not pass credential_id. Fresh Chromium on every run.
+            playwright_instance = await async_playwright().start()
+            browser = await playwright_instance.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                    "--disable-blink-features=AutomationControlled",
+                ],
+            )
+            context = await browser.new_context(
+                viewport={"width": 1440, "height": 900},
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                locale="en-US",
+                timezone_id="America/New_York",
+            )
+            await context.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+                Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
+                window.chrome = {runtime: {}};
+            """)
         page = await context.new_page()
         page.set_default_timeout(20000)
 
@@ -514,8 +550,13 @@ async def _try_browser(base_url, wp_admin_url, username, password, report, statu
 
     finally:
         try:
+            # Persistent context (credential_id path): closing the context
+            # shuts down Chromium directly — there is no separate `browser`
+            # handle. Legacy path: `browser.close()` tears down context too.
             if browser:
                 await browser.close()
+            elif context:
+                await context.close()
             if playwright_instance:
                 await playwright_instance.stop()
         except Exception:

@@ -22,10 +22,15 @@ on ephemeral container storage.
 """
 from __future__ import annotations
 
+import re
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 PROFILE_ROOT = Path("/data/profiles")
+
+# Accepts UUIDs, slugs, and hex digests. Rejects anything that could escape
+# PROFILE_ROOT or pollute the filesystem.
+_CREDENTIAL_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 
 @asynccontextmanager
@@ -41,29 +46,22 @@ async def get_playwright(stealth: bool = False):
 
 def chromium_launch_args(stealth: bool = False) -> dict:
     """
-    Launch kwargs tuned per engine.
+    Launch kwargs for chromium.launch() or chromium.launch_persistent_context().
 
-    Patchright recommends headed Chrome + xvfb for best stealth (DISPLAY=:99 is
-    set in the Dockerfile). Vanilla Playwright runs headless for throughput.
+    Currently returns headless args for both stealth and non-stealth paths.
+    Patchright's stealth value comes primarily from its patched driver, not
+    from headful mode, so headless still strips webdriver, Runtime.enable,
+    and most CDP tells. Moving to headful requires Xvfb in the Dockerfile
+    (DISPLAY=:99 is set but no Xvfb process is started) — future PR.
 
-    --no-sandbox is required because the container runs as non-root appuser
-    without SYS_ADMIN capability. Chromium sandboxing needs root or
-    a user namespace that the slim base image does not provide.
+    --no-sandbox is required because the container runs as non-root appuser.
+    --disable-dev-shm-usage avoids /dev/shm exhaustion in small shm_size
+    allocations (compose gives us 2gb, but defensive anyway).
     """
+    args = ["--no-sandbox", "--disable-dev-shm-usage"]
     if stealth:
-        return {
-            "headless": False,
-            "channel": "chrome",
-            "no_viewport": True,
-            "args": [
-                "--no-sandbox",
-                "--disable-blink-features=AutomationControlled",
-            ],
-        }
-    return {
-        "headless": True,
-        "args": ["--no-sandbox"],
-    }
+        args.append("--disable-blink-features=AutomationControlled")
+    return {"headless": True, "args": args}
 
 
 def profile_dir_for(credential_id: str) -> str:
@@ -78,7 +76,7 @@ def profile_dir_for(credential_id: str) -> str:
     Directory is created on first use; subsequent runs restore cookies,
     localStorage, service workers, and IndexedDB from prior sessions.
     """
-    if not credential_id or "/" in credential_id or ".." in credential_id:
+    if not isinstance(credential_id, str) or not _CREDENTIAL_ID_RE.match(credential_id):
         raise ValueError(f"invalid credential_id: {credential_id!r}")
     path = PROFILE_ROOT / credential_id
     path.mkdir(parents=True, exist_ok=True)
