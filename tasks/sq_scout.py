@@ -71,6 +71,10 @@ async def run_sq_scout(task_id, params, status_callback, env):
         sq_password: str (optional) - Squarespace contributor password
         sq_site_id: str (optional) - Squarespace site identifier (for multi-site accounts)
         callback_url: str (optional)
+        credential_id: str (optional) - workspace_credentials.id. When set,
+            the admin panel scan uses Patchright + a persistent Chromium
+            profile at /data/profiles/<credential_id> so repeated scouts
+            reuse the SQSP login session. Absent -> legacy ephemeral path.
     """
     website_url = params.get("website_url", "").rstrip("/")
     client_slug = params.get("client_slug", "")
@@ -78,6 +82,7 @@ async def run_sq_scout(task_id, params, status_callback, env):
     sq_password = params.get("sq_password", "") or env.get("SQ_PASSWORD", "")
     sq_site_id = params.get("sq_site_id", "")
     callback_url = params.get("callback_url", "")
+    credential_id = params.get("credential_id") or None
     agent_api_key = env.get("AGENT_API_KEY", "")
 
     if not website_url:
@@ -167,7 +172,8 @@ async def run_sq_scout(task_id, params, status_callback, env):
         await status_callback(task_id, "running", "Logging in to Squarespace admin...")
         admin_success = await _scan_admin_panel(
             website_url, sq_email, sq_password, sq_site_id,
-            report, status_callback, task_id
+            report, status_callback, task_id,
+            credential_id=credential_id,
         )
         if admin_success:
             report["method"] = "public+admin" if public_success else "admin"
@@ -728,35 +734,66 @@ async def _try_sq_json_api(client, base_url, report):
 async def _scan_admin_panel(
     website_url, sq_email, sq_password, sq_site_id,
     report, status_callback, task_id,
+    credential_id=None,
 ):
     """Log in to Squarespace admin and gather additional data."""
 
     browser = None
+    context = None
     playwright_instance = None
 
     try:
-        playwright_instance = await async_playwright().start()
-        browser = await playwright_instance.chromium.launch(
-            headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-                "--disable-blink-features=AutomationControlled",
-            ],
-        )
-        context = await browser.new_context(
-            viewport={"width": 1440, "height": 900},
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                       "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-            locale="en-US",
-            timezone_id="America/New_York",
-        )
-        await context.add_init_script("""
-            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-            Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
-            window.chrome = {runtime: {}};
-        """)
+        if credential_id:
+            # Stealth + persistent profile path. Patchright's patched driver
+            # handles webdriver/Runtime.enable/chrome/languages natively —
+            # no add_init_script needed. Persistent context keeps the SQSP
+            # session cookie so subsequent scouts skip the login form
+            # entirely (and the "new device" email it would trigger).
+            from utils.browser import chromium_launch_args, profile_dir_for
+            from patchright.async_api import async_playwright as _patchright_async_playwright
+
+            logger.info(
+                f"sq_scout admin panel: Patchright + persistent profile "
+                f"(credential_id={credential_id})"
+            )
+            playwright_instance = await _patchright_async_playwright().start()
+            context = await playwright_instance.chromium.launch_persistent_context(
+                user_data_dir=profile_dir_for(credential_id),
+                viewport={"width": 1440, "height": 900},
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/131.0.0.0 Safari/537.36"
+                ),
+                locale="en-US",
+                timezone_id="America/New_York",
+                **chromium_launch_args(stealth=True),
+            )
+        else:
+            # Legacy ephemeral path — unchanged behaviour for callers that
+            # do not pass credential_id.
+            playwright_instance = await async_playwright().start()
+            browser = await playwright_instance.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                    "--disable-blink-features=AutomationControlled",
+                ],
+            )
+            context = await browser.new_context(
+                viewport={"width": 1440, "height": 900},
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                           "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                locale="en-US",
+                timezone_id="America/New_York",
+            )
+            await context.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+                Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
+                window.chrome = {runtime: {}};
+            """)
         page = await context.new_page()
         page.set_default_timeout(20000)
 
@@ -804,8 +841,13 @@ async def _scan_admin_panel(
 
     finally:
         try:
+            # Persistent context (credential_id path): closing the context
+            # shuts down Chromium directly — there is no separate `browser`
+            # handle. Legacy path: `browser.close()` tears down context too.
             if browser:
                 await browser.close()
+            elif context:
+                await context.close()
             if playwright_instance:
                 await playwright_instance.stop()
         except Exception:

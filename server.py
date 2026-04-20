@@ -254,9 +254,16 @@ class SqScoutRequest(BaseModel):
     sq_password: Optional[str] = None
     sq_site_id: Optional[str] = None
     callback_url: Optional[str] = None
+    # When set, the admin panel scan uses Patchright + a persistent Chromium
+    # profile at /data/profiles/<credential_id>. Typically one shared SQSP
+    # "Moonraker admin" credential row drives every client site (SQSP's
+    # contributor model lets one login access many sites), so this value
+    # is usually the same across scouts. Absent -> legacy ephemeral path.
+    credential_id: Optional[str] = None
 
     _v_website = field_validator("website_url")(classmethod(lambda cls, v: _validate_http_url(v)))
     _v_callback = field_validator("callback_url")(classmethod(lambda cls, v: _validate_optional_http_url(v)))
+    _v_credential = field_validator("credential_id")(classmethod(lambda cls, v: _validate_optional_credential_id(v)))
 
 
 class WixScoutRequest(BaseModel):
