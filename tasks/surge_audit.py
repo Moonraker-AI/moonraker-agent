@@ -262,21 +262,34 @@ async def execute_surge_audit(
                 submit_confirmed = True
             else:
                 # Signal 2: optimistic UI processing indicators, then re-check
-                # URL after another few seconds to catch slow server redirects
+                # URL after another few seconds to catch slow server redirects.
+                # As of Surge 2.9.9-beta the SPA renders the run UI inline on
+                # /dashboard without a URL change; detect its text markers.
                 processing_indicators = [
                     "safe to close tab",
+                    "safely close this tab",
                     "~20",
                     "processing your audit",
                     "queued for analysis",
+                    "surge analysis in progress",
+                    "analysis in progress",
+                    "activity log",
+                    "pre-scan starting",
+                    "running intelligence",
+                    "elapsed:",
+                    "✓ init",
+                    "✓ queue",
                 ]
                 if any(ind in content_lower_after for ind in processing_indicators):
-                    await asyncio.sleep(10)
-                    later_url = await page.get_url()
-                    if "/dashboard/run/" in later_url or "/run/" in later_url:
-                        submit_confirmed = True
-                    elif later_url != current_url:
-                        # Some kind of navigation happened — trust it
-                        submit_confirmed = True
+                    # Surge's current SPA renders the run inline on
+                    # /dashboard without a URL change — if we see its
+                    # processing markers in the DOM, treat that as a
+                    # confirmed submit and stop waiting for a redirect.
+                    submit_confirmed = True
+                    logger.info(
+                        f"Post-submit confirmed via inline processing indicator "
+                        f"(url unchanged: {current_url})"
+                    )
 
             # If submit didn't confirm, classify precisely: maintenance first
             # (Surge platform down), then target_blocked (target site WAF
