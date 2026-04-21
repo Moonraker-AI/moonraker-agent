@@ -25,7 +25,11 @@ from browser_use import Agent, Browser
 from browser_use.llm import ChatAnthropic
 
 from utils.debug_capture import capture_debug
-from utils.supabase_patch import patch_audit_terminal, should_suppress_notification
+from utils.supabase_patch import (
+    patch_audit_retriable,
+    patch_audit_terminal,
+    should_suppress_notification,
+)
 
 logger = logging.getLogger("agent.surge")
 
@@ -59,6 +63,63 @@ SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
 POLL_INTERVAL_SECONDS = 30       # Check every 30s during Surge processing
 MAX_WAIT_MINUTES = 60            # Give up after 60 minutes
 FORM_FILL_TIMEOUT_SECONDS = 120  # Max time for login + form fill phase
+
+# ── Phase 2 composite-signal thresholds (Push 1, 2026-04-21) ─────────────────
+#
+# Prior to Push 1, the Phase 2 detector fired on ANY of 22 substring markers
+# matched against document.body.innerText. Several of those markers ("analysis
+# complete", "your surge protocol", "run complete") appear in Surge's progress
+# UI and nav chrome *before* the full report finishes rendering. On weak
+# matches the agent would break out of the wait loop early, extract a
+# partially-rendered DOM (as little as 1,708 chars vs normal 150K+), and fire
+# the callback to Client HQ with truncated data. Result: runs that looked
+# "complete" in the admin UI but had scores.rtpba=null and generic template
+# tasks. Reference: Jeanene Wolfe audit 2026-04-21.
+#
+# Push 1 fix (three-layer defense):
+#   1. STRONG_COMPLETION_MARKERS below — progress UI strings removed.
+#   2. Settle gate after any marker: innerText must reach
+#      MIN_STABLE_EXTRACTION_CHARS and hold for PHASE2_STABLE_POLLS
+#      consecutive 30s polls, or the run retriable-fails as phase2_timeout
+#      after PHASE2_SETTLE_MAX_SEC.
+#   3. Extraction guard below the callback: if Phase 3 returns less than
+#      MIN_RAW_CHARS_FOR_CALLBACK, retriable-fail as truncated_extraction
+#      before the callback fires.
+#
+# Thresholds are conservative — every clean audit in production has produced
+# well over 150K chars at both stages. The 100K minimum leaves a wide margin
+# without catching legitimate small-site audits at the low end.
+
+MIN_STABLE_EXTRACTION_CHARS = 100_000   # Phase 2 settle floor
+MIN_RAW_CHARS_FOR_CALLBACK = 100_000    # Phase 3 callback guard
+PHASE2_SETTLE_MAX_SEC = 900             # 15 min max settle window after marker
+PHASE2_STABLE_POLLS = 2                 # consecutive 30s polls meeting the floor
+
+# Surge completion indicators that are SAFE to break on. Removed from the
+# pre-Push-1 list: "analysis complete", "your surge protocol", "surge
+# protocol for", "run complete", "run finished" — all observed to render
+# during progress phases, not only on completion.
+STRONG_COMPLETION_MARKERS = [
+    # Legacy + explicit "run finished" markers
+    "run completed in",
+    "signal health",
+    "copy raw text",
+    "copy raw data",
+    "trust signals",
+    "cres score",
+    "page variance score",
+    # Surge 2.9.9-beta inline results on /dashboard — sections and controls
+    # that only render once the run finishes and the report is populated:
+    "download report",
+    "download raw",
+    "export raw",
+    "entity recognition score",
+    "brand dataset variance",
+    "ai extraction readiness",
+    "rtpba",
+    "ready-to-publish best answer",
+    "ready to publish best answer",
+]
 
 
 # ── Terminal failure helper ──────────────────────────────────────────────────
@@ -126,6 +187,89 @@ async def _terminal_fail(
             await notify_fn(practice_name, client_slug, debug_path)
     except Exception as ne:
         logger.warning(f"Notification failed in _terminal_fail: {ne}")
+
+
+# ── Retriable failure helper ─────────────────────────────────────────────────
+
+async def _retriable_fail(
+    task_id,
+    update_task,
+    audit_id,
+    practice_name,
+    client_slug,
+    page,
+    status_code,
+    user_message,
+    error_detail,
+):
+    """Handle a retriable failure for an audit (Push 1, 2026-04-21).
+
+    Mirrors `_terminal_fail` but routes the Supabase PATCH through
+    `patch_audit_retriable` so Step 0.5 in Client HQ's
+    process-audit-queue cron picks the row back up and requeues it after a
+    5-minute backoff. Notification uses the generic send_error_notification
+    (no dedicated retriable template yet) with a "— will auto-retry" suffix
+    appended to the body so the team knows no manual action is required.
+
+    Five steps, each step best-effort so a downstream error doesn't mask the
+    primary failure reason:
+      1. capture_debug — save HTML + screenshot + innerText to /tmp/agent-debug/
+      2. patch_audit_retriable — flip Supabase to agent_error + retriable=true
+      3. update_task — set agent-local task state so Client HQ polling reads it
+      4. notify_fn — send the team email (suppressed if another audit failed
+         with the same reason_code + retriable=true in the last 2h)
+      5. return (do not raise) so the caller can proceed to `finally` cleanup
+
+    Callers currently: phase2_timeout, truncated_extraction.
+    """
+    # 1. Debug capture — best-effort, returns '' on failure
+    debug_path = ""
+    try:
+        debug_path = await capture_debug(task_id, page, status_code)
+    except Exception as ce:
+        logger.warning(f"Debug capture failed in _retriable_fail: {ce}")
+
+    # 2. Supabase retriable PATCH — best-effort
+    try:
+        await patch_audit_retriable(audit_id, status_code, error_detail, debug_path)
+    except Exception as pe:
+        logger.warning(f"Supabase PATCH failed in _retriable_fail: {pe}")
+
+    # 3. Agent-local task state
+    try:
+        update_task(task_id, status_code, user_message, error=error_detail)
+    except Exception as ue:
+        logger.warning(f"update_task failed in _retriable_fail: {ue}")
+
+    # 4. Team email notification with retriable-scoped suppression
+    try:
+        suppress = False
+        try:
+            suppress = await should_suppress_notification(
+                status_code, audit_id, retriable=True
+            )
+        except Exception as se:
+            logger.warning(f"Suppression check failed in _retriable_fail: {se}")
+        if suppress:
+            logger.info(
+                f"Skipping {status_code} notification for audit {audit_id} "
+                f"(another recent retriable failure with same code)"
+            )
+        else:
+            from utils.notifications import send_error_notification
+            suffix = (
+                " — retriable; the queue cron will auto-requeue this audit "
+                "after a 5-minute cooldown."
+            )
+            debug_suffix = f" Debug: {debug_path}" if debug_path else ""
+            await send_error_notification(
+                practice_name=practice_name,
+                client_slug=client_slug,
+                error_message=f"{error_detail}{suffix}{debug_suffix}",
+                task_id=task_id,
+            )
+    except Exception as ne:
+        logger.warning(f"Notification failed in _retriable_fail: {ne}")
 
 
 # ── Main entry point ─────────────────────────────────────────────────────────
@@ -423,42 +567,111 @@ async def execute_surge_audit(
                 content = await page.evaluate("() => document.body.innerText")
                 content_lower = (content or "").lower()
 
-                completion_indicators = [
-                    # Legacy + explicit "run finished" markers
-                    "run completed in",
-                    "signal health",
-                    "copy raw text",
-                    "copy raw data",
-                    "trust signals",
-                    "cres score",
-                    "page variance score",
-                    # Surge 2.9.9-beta inline results on /dashboard.
-                    # DOM sections that only render once the run finishes:
-                    "analysis complete",
-                    "your surge protocol",
-                    "surge protocol for",
-                    "download report",
-                    "download raw",
-                    "export raw",
-                    "entity recognition score",
-                    "brand dataset variance",
-                    "ai extraction readiness",
-                    "rtpba",
-                    "ready-to-publish best answer",
-                    "ready to publish best answer",
-                    "run finished",
-                    "run complete",
-                ]
-                for indicator in completion_indicators:
+                # Push 1 (2026-04-21): strong markers only. Weak progress-UI
+                # substrings moved to the module-level block comment above
+                # STRONG_COMPLETION_MARKERS. A match here is necessary but
+                # NOT sufficient — the settle gate below must also confirm
+                # the report DOM has actually rendered before we break out.
+                matched_indicator = None
+                for indicator in STRONG_COMPLETION_MARKERS:
                     if indicator in content_lower:
+                        matched_indicator = indicator
                         logger.info(
-                            f"Surge completed (found '{indicator}' in page) after {elapsed_min} min"
+                            f"Phase 2 marker '{indicator}' matched after {elapsed_min} min; "
+                            f"entering settle gate (require >={MIN_STABLE_EXTRACTION_CHARS:,} chars "
+                            f"stable for {PHASE2_STABLE_POLLS} polls, max {PHASE2_SETTLE_MAX_SEC//60} min)"
                         )
+                        break
+
+                if matched_indicator is not None:
+                    # ── Phase 2 settle gate ─────────────────────────────
+                    # Poll innerText length until we see two consecutive
+                    # readings at or above MIN_STABLE_EXTRACTION_CHARS with
+                    # the same length (DOM stopped mutating). If that never
+                    # happens within PHASE2_SETTLE_MAX_SEC, the marker was
+                    # almost certainly a premature progress-UI match and we
+                    # retriable-fail so the next attempt gets a clean run.
+                    update_task(
+                        task_id, "settling",
+                        f"Detected completion signal; verifying report finished rendering"
+                    )
+                    settle_start = time.time()
+                    settle_succeeded = False
+                    stable_count = 0
+                    last_len = -1
+                    final_len = 0
+                    settle_poll_count = 0
+
+                    while (time.time() - settle_start) < PHASE2_SETTLE_MAX_SEC:
+                        settle_poll_count += 1
+                        try:
+                            content_now = await page.evaluate(
+                                "() => document.body ? document.body.innerText : ''"
+                            )
+                            cur_len = len(content_now or "")
+                        except Exception as se:
+                            logger.warning(f"Settle-poll evaluate errored: {se}")
+                            cur_len = 0
+
+                        final_len = cur_len
+                        if settle_poll_count % 3 == 1:
+                            logger.info(
+                                f"Phase 2 settle poll #{settle_poll_count}: "
+                                f"innerText={cur_len:,} chars, "
+                                f"stable_count={stable_count}/{PHASE2_STABLE_POLLS}"
+                            )
+
+                        if cur_len >= MIN_STABLE_EXTRACTION_CHARS:
+                            if cur_len == last_len:
+                                stable_count += 1
+                                if stable_count >= PHASE2_STABLE_POLLS:
+                                    settle_succeeded = True
+                                    logger.info(
+                                        f"Phase 2 settled: {cur_len:,} chars stable "
+                                        f"across {stable_count} polls (marker: '{matched_indicator}')"
+                                    )
+                                    break
+                            else:
+                                stable_count = 1
+                        else:
+                            stable_count = 0
+
+                        last_len = cur_len
+                        await asyncio.sleep(POLL_INTERVAL_SECONDS)
+
+                    if settle_succeeded:
                         completed = True
                         break
 
-                if completed:
-                    break
+                    # Settle timed out → retriable fail
+                    settle_min = int((time.time() - settle_start) / 60)
+                    logger.warning(
+                        f"Phase 2 settle timeout after {settle_min} min. "
+                        f"Marker '{matched_indicator}' fired but innerText "
+                        f"reached only {final_len:,} chars (required "
+                        f"{MIN_STABLE_EXTRACTION_CHARS:,} stable for "
+                        f"{PHASE2_STABLE_POLLS} polls). URL: {current_url}"
+                    )
+                    await _retriable_fail(
+                        task_id, update_task, audit_id,
+                        practice_name, client_slug, page,
+                        "phase2_timeout",
+                        (
+                            f"Audit looked complete but the report did not finish "
+                            f"rendering within {PHASE2_SETTLE_MAX_SEC // 60} minutes. "
+                            f"Will auto-retry."
+                        ),
+                        (
+                            f"Phase 2 settle timeout: marker='{matched_indicator}' "
+                            f"fired at {elapsed_min} min into Phase 2, but innerText "
+                            f"reached only {final_len:,} chars over "
+                            f"{settle_poll_count} settle polls (required "
+                            f">={MIN_STABLE_EXTRACTION_CHARS:,} stable for "
+                            f"{PHASE2_STABLE_POLLS} consecutive polls). "
+                            f"URL at timeout: {current_url}"
+                        ),
+                    )
+                    return
 
                 # Check for error states
                 if "error" in content_lower and "analysis failed" in content_lower:
@@ -494,10 +707,46 @@ async def execute_surge_audit(
         surge_data = await _extract_surge_data(page)
 
         if not surge_data or len(surge_data) < 100:
+            # Extraction fundamentally failed (Copy button didn't work AND
+            # innerText fallback was empty). Keep the original RuntimeError
+            # path — this is a tooling failure, not a truncation, and
+            # server.py's generic error handler will notify. Retry is
+            # unlikely to help without manual investigation.
             raise RuntimeError(
                 f"Extracted data seems too short ({len(surge_data or '')} chars). "
                 "The Copy button may not have worked correctly."
             )
+
+        # Push 1 (2026-04-21): Phase 3 callback guard.
+        # Catch the class of failure where Phase 2 settle was satisfied (or
+        # pre-Push-1, was not even checked) but the Copy-button extraction
+        # returned less than a healthy audit's worth of text. Below the
+        # callback floor, the callback is not fired — the row is flipped to
+        # agent_error+retriable=true so Client HQ's process-audit-queue
+        # Step 0.5 requeues after the 5-min backoff.
+        raw_len = len(surge_data)
+        if raw_len < MIN_RAW_CHARS_FOR_CALLBACK:
+            logger.warning(
+                f"Phase 3 extraction truncated: {raw_len:,} chars "
+                f"(required >={MIN_RAW_CHARS_FOR_CALLBACK:,})"
+            )
+            await _retriable_fail(
+                task_id, update_task, audit_id,
+                practice_name, client_slug, page,
+                "truncated_extraction",
+                (
+                    f"Audit extraction returned only {raw_len:,} characters, "
+                    f"below the {MIN_RAW_CHARS_FOR_CALLBACK:,}-char floor for a "
+                    f"trustworthy report. Will auto-retry."
+                ),
+                (
+                    f"Truncated extraction: surge_data length {raw_len} chars "
+                    f"(required >={MIN_RAW_CHARS_FOR_CALLBACK:,}). "
+                    f"Phase 2 settle passed but Phase 3 Copy-button/innerText "
+                    f"extraction returned short. Callback to Client HQ suppressed."
+                ),
+            )
+            return
 
         logger.info(
             f"Extracted {len(surge_data)} chars of Surge data for {practice_name}"
