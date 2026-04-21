@@ -2,14 +2,21 @@
 Supabase Patch Helper
 =====================
 Centralizes direct PATCH calls from the agent to entity_audits when a task
-hits a terminal non-retriable failure (credits exhausted, Surge maintenance
-mode, silent server-side rejection).
+hits a terminal or retriable failure.
 
-Flips the Supabase row to status='agent_error' with agent_error_retriable=false
-so the Client HQ cron does NOT auto-requeue on its 30-minute cycle. Auto-heal
-(hourly check-surge-blocks cron on Client HQ) handles Surge-side restoration
-for the surge_maintenance and credits_exhausted codes; other codes require
-manual intervention via the Client HQ admin UI.
+Two modes:
+  * patch_audit_terminal  — retriable=false. Cron does NOT auto-requeue.
+    Used for credits_exhausted, surge_maintenance, surge_rejected,
+    target_blocked, generic_exception. Auto-heal (hourly check-surge-blocks
+    cron) handles Surge-side restoration for the surge_maintenance and
+    credits_exhausted codes; other codes require manual intervention via
+    the Client HQ admin UI.
+
+  * patch_audit_retriable — retriable=true. Cron Step 0.5 in
+    process-audit-queue flips the row back to status='queued' after a
+    5-min backoff. Used for phase2_timeout and truncated_extraction where
+    the failure is most likely a transient Surge render issue that will
+    resolve on the next attempt.
 
 Service-role credentials read from env:
   SUPABASE_URL
@@ -36,49 +43,32 @@ def _headers() -> dict:
     }
 
 
-async def patch_audit_terminal(
+async def _patch_audit(
     audit_id: str,
     reason_code: str,
     detail: str,
-    debug_path: str = "",
+    debug_path: str,
+    retriable: bool,
 ) -> bool:
     """
-    PATCH entity_audits row to status='agent_error' with retriable=false.
+    Shared PATCH core. Writes status='agent_error' + retriable flag +
+    reason_code + detail + timestamp + clears agent_task_id.
 
-    Args:
-        audit_id: entity_audits.id UUID
-        reason_code: short code (e.g. 'surge_maintenance', 'credits_exhausted',
-                     'surge_rejected', 'generic_exception'). Written to
-                     last_agent_error_code so the admin UI pill badges and
-                     the auto-heal cron can filter on it.
-        detail: human-readable explanation written to last_agent_error.
-                No prefix is added — the code lives in its own column now.
-        debug_path: optional /tmp/agent-debug/<task_id> path; persisted to
-                    last_debug_path when non-empty.
-
-    Returns:
-        True on success, False on any failure (never raises — caller should
-        still update local task state and send notification regardless).
-
-    Notes:
-        - updated_at is set by the `set_updated_at` BEFORE UPDATE trigger, so
-          it is NOT included in the payload.
-        - agent_task_id is cleared so a downstream requeue does not carry
-          stale state into the next dispatch.
+    Callers should prefer patch_audit_terminal or patch_audit_retriable.
     """
     if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
         logger.warning(
-            "SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY not set; skipping terminal PATCH"
+            "SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY not set; skipping PATCH"
         )
         return False
 
     if not audit_id:
-        logger.warning("patch_audit_terminal called with empty audit_id; skipping")
+        logger.warning("_patch_audit called with empty audit_id; skipping")
         return False
 
     payload = {
         "status": "agent_error",
-        "agent_error_retriable": False,
+        "agent_error_retriable": bool(retriable),
         "last_agent_error_code": reason_code,
         "last_agent_error": detail,
         "last_agent_error_at": datetime.now(timezone.utc).isoformat(),
@@ -96,8 +86,8 @@ async def patch_audit_terminal(
             )
             if resp.status_code < 300:
                 logger.info(
-                    f"Flipped audit {audit_id} to agent_error (retriable=false) "
-                    f"with reason_code={reason_code}"
+                    f"Flipped audit {audit_id} to agent_error "
+                    f"(retriable={retriable}) with reason_code={reason_code}"
                     + (f" debug_path={debug_path}" if debug_path else "")
                 )
                 return True
@@ -111,15 +101,68 @@ async def patch_audit_terminal(
         return False
 
 
+async def patch_audit_terminal(
+    audit_id: str,
+    reason_code: str,
+    detail: str,
+    debug_path: str = "",
+) -> bool:
+    """
+    PATCH entity_audits row to status='agent_error' with retriable=false.
+
+    Use when the failure requires manual intervention (bad credentials,
+    exhausted credits, target WAF block) or must be gated by the
+    check-surge-blocks auto-heal cron (surge_maintenance, credits_exhausted).
+
+    Notes:
+        - updated_at is set by the `set_updated_at` BEFORE UPDATE trigger, so
+          it is NOT included in the payload.
+        - agent_task_id is cleared so a downstream requeue does not carry
+          stale state into the next dispatch.
+        - Returns True on success, False on any failure (never raises — caller
+          should still update local task state and send notification regardless).
+    """
+    return await _patch_audit(audit_id, reason_code, detail, debug_path, retriable=False)
+
+
+async def patch_audit_retriable(
+    audit_id: str,
+    reason_code: str,
+    detail: str,
+    debug_path: str = "",
+) -> bool:
+    """
+    PATCH entity_audits row to status='agent_error' with retriable=true.
+
+    Use when the failure is likely transient and the next dispatch on the
+    same row should be attempted automatically. Step 0.5 in the Client HQ
+    process-audit-queue cron flips status=agent_error + retriable=true
+    rows back to status=queued after a 5-minute backoff.
+
+    Current callers:
+        - phase2_timeout          — Phase 2 marker fired but DOM never settled
+                                    above the extraction threshold within the
+                                    settle window
+        - truncated_extraction    — Phase 3 extraction produced too few chars
+                                    to trust; most likely a partial SPA render
+                                    that will reload cleanly on retry
+
+    Returns True on success, False on any failure (never raises).
+    """
+    return await _patch_audit(audit_id, reason_code, detail, debug_path, retriable=True)
+
+
 async def should_suppress_notification(
     reason_code: str,
     exclude_audit_id: str,
     window_hours: int = 2,
+    retriable: bool = False,
 ) -> bool:
     """
     Return True if another audit has already failed with the SAME reason_code
-    in the past `window_hours`, so we avoid flooding the team with N identical
-    emails when Surge is systemically down.
+    AND the same retriable flag in the past `window_hours`, so we avoid
+    flooding the team with N identical emails when Surge is systemically
+    misbehaving (whether terminally or transiently).
 
     Fails open (returns False) on any error so the first email always gets
     through even if the DB check errors. The downside of a false-negative is
@@ -127,10 +170,14 @@ async def should_suppress_notification(
     is missing a real alert, so open-failure is the right default.
 
     Args:
-        reason_code: the code just persisted (e.g. 'surge_maintenance')
+        reason_code: the code just persisted (e.g. 'surge_maintenance',
+                     'phase2_timeout')
         exclude_audit_id: the current audit's id, excluded from the match so
                           the row we just wrote doesn't suppress its own email
         window_hours: lookback window (default 2h)
+        retriable: match on agent_error_retriable. Defaults to False (terminal)
+                   for back-compat with existing callers; retriable-failure
+                   callers should pass retriable=True.
     """
     if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
         return False
@@ -143,7 +190,7 @@ async def should_suppress_notification(
 
     params = {
         "status": "eq.agent_error",
-        "agent_error_retriable": "eq.false",
+        "agent_error_retriable": f"eq.{'true' if retriable else 'false'}",
         "last_agent_error_code": f"eq.{reason_code}",
         "last_agent_error_at": f"gt.{cutoff}",
         "select": "id",
@@ -169,6 +216,7 @@ async def should_suppress_notification(
             if isinstance(rows, list) and len(rows) > 0:
                 logger.info(
                     f"Suppressing duplicate notification for reason={reason_code} "
+                    f"retriable={retriable} "
                     f"(found {len(rows)} prior in last {window_hours}h)"
                 )
                 return True
