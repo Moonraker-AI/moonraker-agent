@@ -399,28 +399,58 @@ async def execute_surge_audit(
             # Browser Use 0.12.x returns its own Page wrapper, not Playwright's.
             # Use get_url() and evaluate() with arrow function format.
             try:
-                # Strategy 1 (primary): URL changed to results page
+                # Strategy 1: URL routed to the legacy results page.
+                # Surge 2.9.9-beta usually keeps the run UI inline on
+                # /dashboard and only navigates to /dashboard/run/<id> at
+                # the very end (observed in Anna Sky run 2026-04-21). We
+                # still honor the URL as a completion signal when it
+                # does fire, but we no longer *require* it.
                 current_url = await page.get_url()
-                if "/dashboard/run/" in current_url:
+                if "/dashboard/run/" in current_url or "/run/" in current_url:
                     logger.info(
                         f"Surge completed (URL redirect to results): {current_url}"
                     )
                     completed = True
                     break
 
-                # Strategy 2: Check page content for completion indicators
+                # Strategy 2: Check page content for completion indicators.
+                # These are substrings of document.body.innerText (matched
+                # case-insensitively). Keep this list broad; a single
+                # match ends the wait and Phase 3 will verify raw-data
+                # extraction. If Phase 3 can't find a Copy button, it
+                # falls back to innerText — so false-positives here
+                # would surface as empty raw_data, not a silent miss.
                 content = await page.evaluate("() => document.body.innerText")
+                content_lower = (content or "").lower()
 
                 completion_indicators = [
-                    "Run completed in",
-                    "Signal Health",
-                    "Copy raw text",
+                    # Legacy + explicit "run finished" markers
+                    "run completed in",
+                    "signal health",
+                    "copy raw text",
+                    "copy raw data",
                     "trust signals",
-                    "CRES Score",
-                    "PAGE VARIANCE SCORE",
+                    "cres score",
+                    "page variance score",
+                    # Surge 2.9.9-beta inline results on /dashboard.
+                    # DOM sections that only render once the run finishes:
+                    "analysis complete",
+                    "your surge protocol",
+                    "surge protocol for",
+                    "download report",
+                    "download raw",
+                    "export raw",
+                    "entity recognition score",
+                    "brand dataset variance",
+                    "ai extraction readiness",
+                    "rtpba",
+                    "ready-to-publish best answer",
+                    "ready to publish best answer",
+                    "run finished",
+                    "run complete",
                 ]
                 for indicator in completion_indicators:
-                    if indicator in content:
+                    if indicator in content_lower:
                         logger.info(
                             f"Surge completed (found '{indicator}' in page) after {elapsed_min} min"
                         )
@@ -431,7 +461,6 @@ async def execute_surge_audit(
                     break
 
                 # Check for error states
-                content_lower = content.lower()
                 if "error" in content_lower and "analysis failed" in content_lower:
                     raise RuntimeError("Surge reported an analysis failure on the page")
 

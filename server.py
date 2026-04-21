@@ -49,7 +49,7 @@ logger = logging.getLogger("agent")
 from utils.log_redact import install as _install_log_redact
 _install_log_redact()
 
-AGENT_VERSION = "0.6.1"
+AGENT_VERSION = "0.6.2"
 
 app = FastAPI(
     title="Moonraker Agent Service",
