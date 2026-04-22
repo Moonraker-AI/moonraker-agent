@@ -694,9 +694,34 @@ async def execute_surge_audit(
             await asyncio.sleep(POLL_INTERVAL_SECONDS)
 
         if not completed:
-            raise RuntimeError(
-                f"Surge did not complete within {MAX_WAIT_MINUTES} minutes"
+            # Push 2026-04-22: classify the 60-min Phase 2 wait timeout with
+            # a dedicated error code instead of bubbling a bare RuntimeError
+            # through server.py's generic handler (which never set
+            # last_agent_error_code, leaving these audits invisible to the
+            # alerter + blocks digest).
+            #
+            # NOT healable: if Surge didn't reach a results page in a full
+            # hour, retry is extremely unlikely to help. Team reviews, then
+            # manually re-dispatches if target-side conditions change.
+            from utils.notifications import send_rejected_notification
+            await _terminal_fail(
+                task_id, update_task, audit_id,
+                practice_name, client_slug, page,
+                "surge_timeout",
+                (
+                    f"Surge could not produce audit results within "
+                    f"{MAX_WAIT_MINUTES} minutes. The dashboard stayed in a "
+                    f"processing state. This is typically a Surge-side stall "
+                    f"or a target site that takes unusually long to crawl."
+                ),
+                (
+                    f"Phase 2 wait timeout: Surge dashboard URL did not "
+                    f"change to /run/ after {MAX_WAIT_MINUTES} min "
+                    f"(last url={current_url}, target={website_url})"
+                ),
+                send_rejected_notification,
             )
+            return
 
         # ── Phase 3: Extract results (Raw Playwright) ────────────────────
         update_task(task_id, "extracting", "Extracting audit results from Surge")
