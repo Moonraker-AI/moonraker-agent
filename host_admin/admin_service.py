@@ -12,18 +12,25 @@ Security:
 - Command timeout (60s default, 300s max)
 - Output size capped at 1MB
 - Audit logging of every command to /var/log/moonraker-admin/app.log
+- Per-IP in-process rate limit (10 req / 60s) on /admin/exec
+- Off-host Supabase audit tee for /admin/exec calls (fire-and-forget)
 """
 
 import asyncio
+import json
 import logging
 import os
 import secrets
 import time
+import urllib.request
+from collections import deque
 from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
+from threading import Lock
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, HTTPException, Header, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 # ── Logging ──────────────────────────────────────────────────────────────────
@@ -46,12 +53,91 @@ logger.addHandler(logging.StreamHandler())
 
 # ── App ──────────────────────────────────────────────────────────────────────
 
-app = FastAPI(title="Moonraker Host Admin", version="1.0.0")
+app = FastAPI(title="Moonraker Host Admin", version="1.1.0")
 
 ADMIN_API_KEY = os.getenv("AGENT_API_KEY", "")
 MAX_TIMEOUT = 300
 DEFAULT_TIMEOUT = 60
 MAX_OUTPUT_BYTES = 1024 * 1024  # 1MB
+
+SUPABASE_URL = os.getenv("SUPABASE_URL", "")
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
+AUDIT_TABLE = "vps_admin_audit_log"
+
+# ── Rate limit (per-IP, in-process) ──────────────────────────────────────────
+
+_rate_lock = Lock()
+_rate_state: dict[str, deque] = {}
+_RATE_LIMIT = 10
+_RATE_WINDOW = 60.0
+
+
+def _client_ip(request: Request) -> str:
+    """Prefer X-Forwarded-For (Caddy forwards it), fallback to client.host."""
+    xff = request.headers.get("x-forwarded-for", "")
+    if xff:
+        return xff.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+def _rate_check(ip: str) -> bool:
+    now = time.monotonic()
+    with _rate_lock:
+        dq = _rate_state.setdefault(ip, deque())
+        while dq and dq[0] <= now - _RATE_WINDOW:
+            dq.popleft()
+        if len(dq) >= _RATE_LIMIT:
+            return False
+        dq.append(now)
+        return True
+
+
+# ── Supabase audit tee (fire-and-forget) ─────────────────────────────────────
+
+def _supabase_insert_sync(payload: dict) -> None:
+    """Blocking POST to Supabase REST. Called from a thread via asyncio."""
+    if not (SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY):
+        return
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/{AUDIT_TABLE}"
+        body = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=body,
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "apikey": SUPABASE_SERVICE_ROLE_KEY,
+                "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+                "Prefer": "return=minimal",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            if resp.status >= 300:
+                logger.warning(f"supabase_audit.non2xx status={resp.status}")
+    except Exception as e:
+        # Never raise: we're fire-and-forget.
+        logger.warning(f"supabase_audit.error {type(e).__name__}: {e}")
+
+
+async def _audit_tee(
+    client_ip: str,
+    command: str,
+    exit_code: int,
+    duration_ms: int,
+) -> None:
+    """Insert an audit row into Supabase without blocking the request path."""
+    payload = {
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "client_ip": client_ip,
+        "command_truncated": (command or "")[:4096],
+        "exit_code": exit_code,
+        "duration_ms": duration_ms,
+    }
+    try:
+        await asyncio.to_thread(_supabase_insert_sync, payload)
+    except Exception as e:
+        logger.warning(f"supabase_audit.schedule_error {type(e).__name__}: {e}")
 
 
 # ── Auth ─────────────────────────────────────────────────────────────────────
@@ -88,19 +174,33 @@ async def admin_health(authorization: str = Header(default="")):
     return {
         "status": "ok",
         "service": "moonraker-host-admin",
-        "version": "1.0.0",
+        "version": "1.1.0",
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
 
 @app.post("/admin/exec", response_model=ExecResponse)
-async def exec_command(req: ExecRequest, authorization: str = Header(default="")):
+async def exec_command(
+    req: ExecRequest,
+    request: Request,
+    authorization: str = Header(default=""),
+):
+    # Rate limit BEFORE auth so throttled callers don't even reach the bearer check.
+    ip = _client_ip(request)
+    if not _rate_check(ip):
+        logger.warning(f"rate_limit.exceeded ip={ip} limit={_RATE_LIMIT}/{_RATE_WINDOW}s")
+        return JSONResponse(
+            status_code=429,
+            content={"detail": "rate limit exceeded"},
+            headers={"Retry-After": str(int(_RATE_WINDOW))},
+        )
+
     await verify_key(authorization)
 
     # Clamp timeout
     timeout = min(req.timeout or DEFAULT_TIMEOUT, MAX_TIMEOUT)
 
-    logger.info(f"EXEC: {req.command!r} (timeout={timeout}s, cwd={req.working_dir})")
+    logger.info(f"EXEC ip={ip}: {req.command!r} (timeout={timeout}s, cwd={req.working_dir})")
 
     start = time.monotonic()
 
@@ -121,6 +221,7 @@ async def exec_command(req: ExecRequest, authorization: str = Header(default="")
             await proc.communicate()
             duration_ms = int((time.monotonic() - start) * 1000)
             logger.warning(f"TIMEOUT after {timeout}s: {req.command!r}")
+            asyncio.create_task(_audit_tee(ip, req.command, -1, duration_ms))
             return ExecResponse(
                 stdout="",
                 stderr=f"Command timed out after {timeout}s",
@@ -132,6 +233,7 @@ async def exec_command(req: ExecRequest, authorization: str = Header(default="")
     except Exception as e:
         duration_ms = int((time.monotonic() - start) * 1000)
         logger.error(f"EXEC ERROR: {e}")
+        asyncio.create_task(_audit_tee(ip, req.command, -1, duration_ms))
         return ExecResponse(
             stdout="",
             stderr=str(e),
@@ -158,6 +260,9 @@ async def exec_command(req: ExecRequest, authorization: str = Header(default="")
         f"DONE: exit={proc.returncode} duration={duration_ms}ms "
         f"stdout={len(stdout_str)}b stderr={len(stderr_str)}b"
     )
+
+    # Fire-and-forget audit tee to Supabase.
+    asyncio.create_task(_audit_tee(ip, req.command, proc.returncode, duration_ms))
 
     return ExecResponse(
         stdout=stdout_str,
