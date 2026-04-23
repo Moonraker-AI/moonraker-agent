@@ -33,6 +33,7 @@ from tasks.apply_neo_overlay import run_apply_neo_overlay
 from tasks.wp_scout import run_wp_scout
 from tasks.sq_scout import run_sq_scout
 from tasks.wix_scout import run_wix_scout
+from tasks.sitemap_scout import run_sitemap_scout
 from tasks.surge_status_check import check_surge_status
 
 load_dotenv()
@@ -49,7 +50,7 @@ logger = logging.getLogger("agent")
 from utils.log_redact import install as _install_log_redact
 _install_log_redact()
 
-AGENT_VERSION = "0.7.0"
+AGENT_VERSION = "0.7.1"
 
 app = FastAPI(
     title="Moonraker Agent Service",
@@ -272,6 +273,15 @@ class WixScoutRequest(BaseModel):
     callback_url: Optional[str] = None
 
     _v_website = field_validator("website_url")(classmethod(lambda cls, v: _validate_http_url(v)))
+    _v_callback = field_validator("callback_url")(classmethod(lambda cls, v: _validate_optional_http_url(v)))
+
+
+class SitemapScoutRequest(BaseModel):
+    root_url: str
+    client_slug: Optional[str] = None
+    callback_url: Optional[str] = None
+
+    _v_root = field_validator("root_url")(classmethod(lambda cls, v: _validate_http_url(v)))
     _v_callback = field_validator("callback_url")(classmethod(lambda cls, v: _validate_optional_http_url(v)))
 class TaskStatusResponse(BaseModel):
     task_id: str
@@ -561,6 +571,31 @@ async def create_wix_scout(request: WixScoutRequest):
     asyncio.create_task(_run_wix_scout_with_lock(task_id))
     logger.info(
         f"Queued Wix scout {task_id[:12]} for '{request.website_url}'"
+    )
+
+    return {"task_id": task_id, "status": "queued"}
+
+@app.post("/tasks/sitemap-scout", dependencies=[Depends(verify_api_key)])
+async def create_sitemap_scout(request: SitemapScoutRequest):
+    task_id = f"sitemap-{uuid.uuid4()}"
+    now = datetime.now(timezone.utc).isoformat()
+
+    tasks[task_id] = {
+        "task_id": task_id,
+        "type": "sitemap-scout",
+        "status": "queued",
+        "message": "Sitemap scout queued",
+        "created_at": now,
+        "updated_at": now,
+        "error": None,
+        "duration_seconds": None,
+        "request": request.model_dump(),
+        "result": None,
+    }
+
+    asyncio.create_task(_run_sitemap_scout_no_lock(task_id))
+    logger.info(
+        f"Queued sitemap scout {task_id[:12]} for '{request.root_url}'"
     )
 
     return {"task_id": task_id, "status": "queued"}
@@ -889,3 +924,26 @@ async def _run_wix_scout_with_lock(task_id: str):
 
         logger.info(f"Post-task cooldown: {LIGHT_TASK_COOLDOWN}s")
         await asyncio.sleep(LIGHT_TASK_COOLDOWN)
+
+
+async def _run_sitemap_scout_no_lock(task_id: str):
+    """Tier 1 (No Lock): HTTP-only sitemap discovery + categorization.
+    Pure httpx + at most one Anthropic API call. No browser, no preflight,
+    no post-task cooldown — runs immediately and in parallel with other tasks."""
+    update_task(task_id, "running", "Starting sitemap scout")
+    try:
+        env = {
+            "AGENT_API_KEY": os.getenv("AGENT_API_KEY", ""),
+            "ANTHROPIC_API_KEY": os.getenv("ANTHROPIC_API_KEY", ""),
+        }
+        result = await run_sitemap_scout(
+            task_id=task_id,
+            params=tasks[task_id]["request"],
+            status_callback=_async_update_task,
+            env=env,
+        )
+        if task_id in tasks and result:
+            tasks[task_id]["result"] = result
+    except Exception as e:
+        logger.exception(f"Sitemap scout {task_id[:12]} failed")
+        update_task(task_id, "error", f"Scout failed: {str(e)[:200]}", error=str(e))
