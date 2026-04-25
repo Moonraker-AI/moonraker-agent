@@ -268,6 +268,130 @@ def _looks_like_sitemap_index(xml_text):
     return "<sitemapindex" in xml_text or "<sitemap>" in xml_text
 
 
+# ── Nav extraction ──────────────────────────────────────────────────────────
+# Pulls the URLs that appear in the site's header navigation (incl. dropdowns)
+# from the homepage HTML. Used downstream to flag site_map_pages.in_nav so the
+# configurator can show a "featured in menu" badge on pages the client links
+# to from their main menu.
+#
+# Strategy: try CMS-specific selectors in order of specificity, fall back to a
+# generic <header>/<nav> sweep. First strategy returning ≥ 2 same-origin links
+# wins. Returns (urls, method_str). method_str is one of:
+#   squarespace_71 | squarespace_70 | wordpress | header_fallback | unsupported
+NAV_BLOCK_PATTERNS = [
+    # Squarespace 7.1: <nav class="header-nav-list ..."> ... </nav> and the
+    # mobile menu nav. Both are server-rendered. Folder/dropdown links are
+    # inside .header-nav-folder-content but live in the same outer block.
+    ("squarespace_71", re.compile(
+        r'<(nav|div)[^>]*class="[^"]*\b(?:header-nav|header-menu-nav|header-nav-list)\b[^"]*"[^>]*>(.*?)</\1>',
+        re.IGNORECASE | re.DOTALL
+    )),
+    # Squarespace 7.0 (Brine et al.): capitalized class names.
+    ("squarespace_70", re.compile(
+        r'<(nav|div)[^>]*class="[^"]*\bHeader-nav\b[^"]*"[^>]*>(.*?)</\1>',
+        re.IGNORECASE | re.DOTALL
+    )),
+    # WordPress: most themes wrap the primary menu in <nav> with one of these
+    # classes. Items are <li class="menu-item"><a href="...">.
+    ("wordpress", re.compile(
+        r'<nav[^>]*class="[^"]*\b(?:main-navigation|primary-menu|primary-navigation|nav-menu|menu)\b[^"]*"[^>]*>(.*?)</nav>',
+        re.IGNORECASE | re.DOTALL
+    )),
+]
+
+# Generic fallback: any <header>...</header> or <nav>...</nav> block.
+# We sweep all matches; some sites have multiple nav blocks (e.g. mobile +
+# desktop). De-dup happens later.
+HEADER_FALLBACK_PATTERN = re.compile(
+    r'<(header|nav)[^>]*>(.*?)</\1>', re.IGNORECASE | re.DOTALL
+)
+
+# href extractor that tolerates single quotes, double quotes, and (rare) bare
+# attributes. We capture only the URL value.
+HREF_PATTERN = re.compile(
+    r'<a\b[^>]*\bhref\s*=\s*(?:"([^"]+)"|\'([^\']+)\'|([^\s>]+))',
+    re.IGNORECASE
+)
+
+
+def _normalize_nav_url(href, root_url):
+    """Resolve href against root_url, strip fragment + query, lowercase host,
+    drop trailing slash. Returns None if not same-origin or not a real link."""
+    if not href:
+        return None
+    href = href.strip()
+    # Skip placeholder / non-navigational hrefs
+    if href.startswith(("#", "mailto:", "tel:", "javascript:", "sms:")):
+        return None
+    try:
+        absolute = urljoin(root_url + "/", href)
+        parsed = urlparse(absolute)
+        root_parsed = urlparse(root_url)
+    except Exception:
+        return None
+    if parsed.scheme not in ("http", "https"):
+        return None
+    if parsed.netloc.lower() != root_parsed.netloc.lower():
+        return None  # external link
+    path = parsed.path or "/"
+    # Strip fragment and query — nav links rarely use them meaningfully and
+    # they break dedupe against sitemap URLs which don't carry them.
+    normalized = parsed.scheme + "://" + parsed.netloc.lower() + path
+    return normalized.rstrip("/").lower()
+
+
+def _hrefs_from_block(block_html, root_url):
+    """Pull all same-origin URLs from a chunk of HTML."""
+    urls = []
+    for m in HREF_PATTERN.finditer(block_html):
+        href = m.group(1) or m.group(2) or m.group(3)
+        norm = _normalize_nav_url(href, root_url)
+        if norm:
+            urls.append(norm)
+    return urls
+
+
+def _extract_nav_urls(html, root_url):
+    """Return (list[str], method) — list of normalized nav URLs and the
+    extraction method that produced them. Empty list + 'unsupported' if no
+    strategy yielded ≥ 2 links (likely JS-rendered nav, e.g. Wix)."""
+    if not html:
+        return [], "unsupported"
+
+    # Try CMS-specific patterns first
+    for method, pattern in NAV_BLOCK_PATTERNS:
+        all_urls = []
+        for m in pattern.finditer(html):
+            # Block content is the last capturing group
+            block = m.group(m.lastindex)
+            all_urls.extend(_hrefs_from_block(block, root_url))
+        # Dedupe while preserving order
+        seen = set()
+        deduped = []
+        for u in all_urls:
+            if u not in seen:
+                seen.add(u)
+                deduped.append(u)
+        if len(deduped) >= 2:
+            return deduped, method
+
+    # Fallback: any <header> or <nav> block
+    all_urls = []
+    for m in HEADER_FALLBACK_PATTERN.finditer(html):
+        block = m.group(2)
+        all_urls.extend(_hrefs_from_block(block, root_url))
+    seen = set()
+    deduped = []
+    for u in all_urls:
+        if u not in seen:
+            seen.add(u)
+            deduped.append(u)
+    if len(deduped) >= 2:
+        return deduped, "header_fallback"
+
+    return [], "unsupported"
+
+
 async def _discover_sitemap_urls(client, base_url):
     """
     Find sitemap URL(s) for the site. Tries common locations + robots.txt.
@@ -522,7 +646,7 @@ async def run_sitemap_scout(task_id, params, status_callback, env):
     started_at = datetime.now(timezone.utc)
 
     report = {
-        "scout_version": "1.0",
+        "scout_version": "1.1",
         "scanned_at": started_at.isoformat(),
         "root_url": root_url,
         "client_slug": client_slug,
@@ -530,6 +654,8 @@ async def run_sitemap_scout(task_id, params, status_callback, env):
         "total_pages": 0,
         "pages_by_category": {},    # {category: [{url}]}
         "collapsed_categories": {}, # {category: {count, sample_count, all_urls}}
+        "nav_urls": [],             # normalized URLs found in homepage nav (incl. dropdowns)
+        "nav_extraction_method": None,  # squarespace_71 | squarespace_70 | wordpress | header_fallback | unsupported
         "errors": [],
         "duration_seconds": 0,
     }
@@ -555,6 +681,25 @@ async def run_sitemap_scout(task_id, params, status_callback, env):
                 await status_callback(task_id, "running", "No sitemap, crawling...")
                 urls = await _bounded_crawl(client, root_url)
                 logger.info(f"sitemap-scout {task_id[:12]}: crawl -> {len(urls)} URLs")
+
+            # ── Step 2b: Extract homepage nav (best-effort; never fails scout) ─
+            # Used to flag site_map_pages.in_nav for the configurator badge.
+            try:
+                hp_status, hp_html = await _fetch_text(client, root_url + "/")
+                if hp_status == 200 and hp_html:
+                    nav_urls, nav_method = _extract_nav_urls(hp_html, root_url)
+                    report["nav_urls"] = nav_urls
+                    report["nav_extraction_method"] = nav_method
+                    logger.info(
+                        f"sitemap-scout {task_id[:12]} nav: {nav_method} -> {len(nav_urls)} link(s)"
+                    )
+                else:
+                    report["nav_extraction_method"] = "unsupported"
+                    logger.info(f"sitemap-scout {task_id[:12]} nav: homepage status {hp_status}")
+            except Exception as e:
+                report["nav_extraction_method"] = "unsupported"
+                report["errors"].append(f"nav extraction failed: {e}")
+                logger.warning(f"sitemap-scout {task_id[:12]} nav extraction error: {e}")
 
             if not urls:
                 report["errors"].append("No URLs discovered (sitemap missing and crawl returned 0).")
