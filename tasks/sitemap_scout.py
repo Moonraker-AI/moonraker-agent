@@ -123,14 +123,15 @@ CATEGORY_PATTERNS = [
     # Service pages — therapy modalities + presenting issues.
     # Patterns:
     #   1. Suffix-based: <anything>-therapy/-therapies/-counseling/-counselling/
-    #      -treatment/-recovery/-coaching, optionally with -2/-3 numeric suffix
-    #      or trailing modality token (-cbt/-emdr/-dbt/-ifs/-act)
-    #   2. (therapy|counseling|counselling)-for-<anything>  +  online-(therapy|counseling)(-in-<location>)?
+    #      -treatment/-recovery/-coaching, optionally with -2/-3 numeric suffix,
+    #      trailing modality token (-cbt/-emdr/-dbt/-ifs/-act), or a trailing
+    #      -services modifier (e.g. /phobia-therapy-services/)
+    #   2. (therapy|therapies|counseling|counselling)-for-<anything>  +  online-(therapy|counseling)(-in-<location>)?
     #   3. hypnosis-for-<anything>
     #   4. Single-segment path matching a known modality/issue keyword (e.g. /emdr, /brainspotting)
     ("service",       re.compile(
-        r"^/[a-z0-9-]+-(therapy|therapies|counseling|counselling|treatment|recovery|coaching)(-(cbt|emdr|dbt|ifs|act))?(-\d+)?/?$"
-        r"|^/(therapy|counseling|counselling|coaching)-for-[a-z0-9-]+/?$"
+        r"^/[a-z0-9-]+-(therapy|therapies|counseling|counselling|treatment|recovery|coaching)(-(cbt|emdr|dbt|ifs|act|services))?(-\d+)?/?$"
+        r"|^/(therapy|therapies|counseling|counselling|coaching)-for-[a-z0-9-]+/?$"
         r"|^/[a-z0-9-]+-coaching-for-[a-z0-9-]+/?$"
         r"|^/online-(therapy|counseling|counselling)(-in-[a-z-]+)?/?$"
         r"|^/hypnosis-for-[a-z0-9-]+/?$"
