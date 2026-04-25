@@ -69,6 +69,11 @@ CATEGORY_PATTERNS = [
     # FAQ
     ("faq",           re.compile(r"/faqs?(-\d+)?(-\d+)?/?$|/frequently-asked-questions/?$|/questions/?$")),
     # Bio / team — patterns vary widely. /team/, /staff/, /our-people/, /meet-<n>/
+    # Also catches practice-slug-suffixed bios like /anna-skytherapies/ where
+    # the last hyphen-token is a person+practice mash (e.g. skytherapies =
+    # sky + therapies). Requires the final token to be [a-z]{3,} prefix +
+    # therapies/therapy/counseling/etc, so plain /body-based-therapies/ (final
+    # token is bare 'therapies' with no 3-char prefix) does NOT match here.
     ("bio",           re.compile(
         r"/(meet-|about-)?(our-)?(team|staff|therapists|clinicians|providers|psychologists|counselors|counsellors)(/[^/]+)?/?$"
         r"|/our-people/?$"
@@ -77,13 +82,15 @@ CATEGORY_PATTERNS = [
         r"|/staff/[^/]+/?$"
         r"|/providers/[^/]+/?$"
         r"|/about/[^/]+/?$"
+        r"|^/[a-z]+(-[a-z]+){0,3}-[a-z]{3,}(therapies|therapy|counseling|counselling|wellness|psychology|psychotherapy|clinic|clinics)/?$"
     )),
     # Locations
     ("location",      re.compile(
         r"/locations?/?$"
         r"|/locations?/[^/]+/?$"
-        r"|/[a-z]+-(nm|ny|ca|tx|fl|wa|or|az|co|ma|il|pa|oh|ga|nc|sc|va|mi|mn|wi|in|tn|mo|md|nj|ct|ut|ia|ks|ne|nv|nh|me|ri|de|mt|sd|nd|wy|ak|hi|wv|ar|ms|al|ky|la|id|ok)/?$"
-        r"|/(albuquerque|atlanta|austin|baltimore|boston|charlotte|chicago|cleveland|columbus|dallas|denver|detroit|houston|indianapolis|jacksonville|kansas-city|las-vegas|los-angeles|memphis|miami|milwaukee|minneapolis|nashville|new-york|nyc|oklahoma-city|omaha|orlando|philadelphia|phoenix|pittsburgh|portland|raleigh|sacramento|salt-lake-city|san-antonio|san-diego|san-francisco|san-jose|seattle|tampa|toronto|tucson|tulsa|vancouver|virginia-beach|washington-dc|washington)(-[a-z]+)*/?$"
+        r"|/[a-z]+(-[a-z]+)*-(nm|ny|ca|tx|fl|wa|or|az|co|ma|il|pa|oh|ga|nc|sc|va|mi|mn|wi|in|tn|mo|md|nj|ct|ut|ia|ks|ne|nv|nh|me|ri|de|mt|sd|nd|wy|ak|hi|wv|ar|ms|al|ky|la|id|ok)/?$"
+        r"|/[a-z]+(-[a-z]+)*-(ontario|quebec|alberta|manitoba|saskatchewan|newfoundland|labrador|nova-scotia|new-brunswick|prince-edward-island|yukon|nunavut|northwest-territories|british-columbia|on|qc|ab|mb|sk|nl|ns|nb|pe|yt|nt|bc)/?$"
+        r"|/(albuquerque|atlanta|austin|baltimore|boston|charlotte|chicago|cleveland|columbus|dallas|denver|detroit|houston|indianapolis|jacksonville|kansas-city|las-vegas|los-angeles|memphis|miami|milwaukee|minneapolis|nashville|new-york|nyc|oklahoma-city|omaha|orlando|philadelphia|phoenix|pittsburgh|portland|raleigh|sacramento|salt-lake-city|san-antonio|san-diego|san-francisco|san-jose|seattle|tampa|toronto|tucson|tulsa|vancouver|virginia-beach|washington-dc|washington|brampton|guelph|kingston|markham|mississauga|north-york|oakville|oshawa|ottawa|peterborough|hamilton|london|kitchener|waterloo|cambridge|burlington|barrie|st-catharines|niagara|windsor|thunder-bay|sudbury|montreal|laval|quebec-city|calgary|edmonton|red-deer|winnipeg|saskatoon|regina|halifax|st-johns|charlottetown|fredericton)(-[a-z]+)*/?$"
     )),
     # Blog index — catches standard names + custom "*blog" names (e.g. /selfenergyblog)
     # plus SQSP-style duplicates (/blog-1, /blog-2)
@@ -114,16 +121,20 @@ CATEGORY_PATTERNS = [
         r"|/\d{4}/\d{2}/[^/]+/?$"
     )),
     # Service pages — therapy modalities + presenting issues.
-    # Three patterns:
-    #   1. Suffix-based: <anything>-therapy / -counseling / -counselling / -treatment / -recovery / -coaching
+    # Patterns:
+    #   1. Suffix-based: <anything>-therapy/-therapies/-counseling/-counselling/
+    #      -treatment/-recovery/-coaching, optionally with -2/-3 numeric suffix
+    #      or trailing modality token (-cbt/-emdr/-dbt/-ifs/-act)
     #   2. (therapy|counseling|counselling)-for-<anything>  +  online-(therapy|counseling)(-in-<location>)?
-    #   3. Single-segment path matching a known modality/issue keyword (e.g. /emdr, /brainspotting)
+    #   3. hypnosis-for-<anything>
+    #   4. Single-segment path matching a known modality/issue keyword (e.g. /emdr, /brainspotting)
     ("service",       re.compile(
-        r"^/[a-z0-9-]+-(therapy|counseling|counselling|treatment|recovery|coaching)/?$"
+        r"^/[a-z0-9-]+-(therapy|therapies|counseling|counselling|treatment|recovery|coaching)(-(cbt|emdr|dbt|ifs|act))?(-\d+)?/?$"
         r"|^/(therapy|counseling|counselling|coaching)-for-[a-z0-9-]+/?$"
         r"|^/[a-z0-9-]+-coaching-for-[a-z0-9-]+/?$"
         r"|^/online-(therapy|counseling|counselling)(-in-[a-z-]+)?/?$"
-        r"|^/(anxiety|depression|trauma|ptsd|emdr|cbt|dbt|grief|couples|family|teen|adolescent|child|individual|group|sex|intimacy|relationship|marriage|premarital|discernment|infidelity|affair|addiction|substance|adhd|autism|bipolar|ocd|eating-disorder|anorexia|bulimia|binge|body-image|self-esteem|stress|burnout|career|life-transition|lgbtq|gay|lesbian|trans|queer|bipoc|men|women|maternal|postpartum|perinatal|infertility|miscarriage|pregnancy|parenting|narcissistic-abuse|codependency|attachment|complex-trauma|brainspotting|ifs|internal-family-systems|parts-work|somatic|gottman|emotionally-focused|psychodynamic|solution-focused|mindfulness|christian-counseling|faith-based|holistic|intensive|intensives|retreat|retreats)/?$"
+        r"|^/hypnosis-for-[a-z0-9-]+/?$"
+        r"|^/(anxiety|depression|trauma|ptsd|emdr|cbt|dbt|grief|couples|family|teen|adolescent|child|individual|group|sex|intimacy|relationship|marriage|premarital|discernment|infidelity|affair|addiction|substance|adhd|autism|bipolar|ocd|eating-disorder|anorexia|bulimia|binge|body-image|self-esteem|stress|burnout|career|life-transition|lgbtq|gay|lesbian|trans|queer|bipoc|men|women|maternal|postpartum|perinatal|infertility|miscarriage|pregnancy|parenting|narcissistic-abuse|codependency|attachment|complex-trauma|brainspotting|ifs|internal-family-systems|parts-work|somatic|gottman|emotionally-focused|psychodynamic|solution-focused|mindfulness|christian-counseling|faith-based|holistic|intensive|intensives|retreat|retreats|fibromyalgia|hypnosis|phobia|phobias)/?$"
     )),
     # Home indicators (incl. SQSP duplicates like /home-2)
     ("home",          re.compile(r"^/?$|^/home(-\d+)?/?$|^/index(\.html?)?/?$|^/welcome/?$")),
