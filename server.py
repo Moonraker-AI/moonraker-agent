@@ -35,6 +35,7 @@ from tasks.sq_scout import run_sq_scout
 from tasks.wix_scout import run_wix_scout
 from tasks.sitemap_scout import run_sitemap_scout
 from tasks.surge_status_check import check_surge_status
+from tasks.design_audit import run_design_audit
 
 load_dotenv()
 
@@ -283,6 +284,35 @@ class SitemapScoutRequest(BaseModel):
 
     _v_root = field_validator("root_url")(classmethod(lambda cls, v: _validate_http_url(v)))
     _v_callback = field_validator("callback_url")(classmethod(lambda cls, v: _validate_optional_http_url(v)))
+
+class DesignAuditRequest(BaseModel):
+    """Synchronous design audit. Caller blocks until findings return."""
+    url: str
+    viewport_width: Optional[int] = 1440
+    viewport_height: Optional[int] = 900
+    wait_for_selector: Optional[str] = None
+    timeout_seconds: Optional[int] = 30
+
+    _v_url = field_validator("url")(classmethod(lambda cls, v: _validate_http_url(v)))
+
+    @field_validator("viewport_width", "viewport_height")
+    @classmethod
+    def _v_vp(cls, v):
+        if v is None:
+            return v
+        if not isinstance(v, int) or v < 320 or v > 3840:
+            raise ValueError("viewport dimensions must be int 320-3840")
+        return v
+
+    @field_validator("timeout_seconds")
+    @classmethod
+    def _v_to(cls, v):
+        if v is None:
+            return 30
+        if not isinstance(v, int) or v < 5 or v > 60:
+            raise ValueError("timeout_seconds must be int 5-60")
+        return v
+
 class TaskStatusResponse(BaseModel):
     task_id: str
     status: str
@@ -599,6 +629,63 @@ async def create_sitemap_scout(request: SitemapScoutRequest):
     )
 
     return {"task_id": task_id, "status": "queued"}
+
+@app.post("/tasks/design-audit", dependencies=[Depends(verify_api_key)])
+async def create_design_audit(request: DesignAuditRequest):
+    """
+    Synchronous design audit. Acquires the browser lock, runs the impeccable
+    detector against the URL, returns findings directly. ~5-15s typical.
+
+    Unlike other browser tasks, this does NOT register a task_id or callback.
+    The caller blocks until the audit completes (or hits timeout_seconds).
+
+    Returned shape: see tasks.design_audit.run_design_audit docstring.
+    """
+    started = datetime.now(timezone.utc).isoformat()
+    logger.info(f"design-audit: starting for {request.url}")
+
+    # Acquire the same lock used by other browser tasks. If a Surge audit is
+    # mid-flight, this blocks until it finishes — acceptable since design
+    # audits are infrequent and the caller can retry.
+    try:
+        async with asyncio.timeout(request.timeout_seconds + 5):
+            async with browser_lock:
+                try:
+                    result = await run_design_audit(
+                        url=request.url,
+                        viewport={
+                            "width": request.viewport_width or 1440,
+                            "height": request.viewport_height or 900,
+                        },
+                        wait_for=request.wait_for_selector,
+                        timeout_seconds=request.timeout_seconds or 30,
+                    )
+                    # Light task — short cooldown
+                    await asyncio.sleep(LIGHT_TASK_COOLDOWN)
+                    logger.info(
+                        f"design-audit: complete for {request.url} "
+                        f"({result['summary']['total']} findings, {result['duration_ms']}ms)"
+                    )
+                    return {
+                        "status": "complete",
+                        "started_at": started,
+                        **result,
+                    }
+                except TimeoutError as e:
+                    logger.warning(f"design-audit: hard timeout — {e}")
+                    raise HTTPException(status_code=504, detail=str(e))
+                except FileNotFoundError as e:
+                    logger.error(f"design-audit: detector missing — {e}")
+                    raise HTTPException(status_code=500, detail="Design detector not deployed")
+                except Exception as e:
+                    logger.exception(f"design-audit: failed for {request.url}")
+                    raise HTTPException(
+                        status_code=502,
+                        detail=f"Audit failed: {str(e)[:200]}",
+                    )
+    except asyncio.TimeoutError:
+        logger.warning(f"design-audit: outer timeout for {request.url}")
+        raise HTTPException(status_code=504, detail="Audit timed out waiting for browser lock or completion")
 
 @app.get("/tasks/{task_id}/status", dependencies=[Depends(verify_api_key)])
 async def get_task_status(task_id: str):
