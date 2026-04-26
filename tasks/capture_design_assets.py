@@ -404,7 +404,13 @@ async def capture_page(page, url, client_slug, page_type, extract_css=False):
 
 
 async def discover_pages(page, base_url):
-    """Find service and about pages by scanning homepage links."""
+    """Find service and about pages by scanning homepage links.
+
+    2026-04-26: filters boilerplate paths (terms, privacy, etc.) before
+    matching, so the 'service' regex doesn't grab '/terms-of-service' on
+    SPA sites. Also prefers specific therapy/clinical patterns over the
+    generic 'service' word.
+    """
     links = await page.evaluate("""(baseUrl) => {
         const anchors = [...document.querySelectorAll('a[href]')];
         const urls = anchors.map(a => {
@@ -418,21 +424,52 @@ async def discover_pages(page, base_url):
 
         const unique = [...new Set(internal)];
 
-        // Service page patterns
-        const servicePatterns = [/therapy/i, /counseling/i, /treatment/i, /service/i, /emdr/i, /anxiety/i, /depression/i, /trauma/i, /ptsd/i, /couples/i, /pain/i, /specialt/i];
-        const service = unique.find(u => {
-            const path = new URL(u).pathname.toLowerCase();
-            return path !== '/' && servicePatterns.some(p => p.test(path));
+        // Boilerplate paths to ignore — present on most therapy sites but
+        // never the service or about page. Match anywhere in the path.
+        const boilerplatePatterns = [
+            /\\bterms\\b/i, /\\bprivacy\\b/i, /\\blicense\\b/i, /\\bsign-?in\\b/i,
+            /\\blog-?in\\b/i, /\\blog-?out\\b/i, /\\bcheckout\\b/i, /\\bpayment\\b/i,
+            /\\bdisclaimer\\b/i, /\\bcookies?\\b/i, /\\baccessibility\\b/i,
+            /\\bsitemap\\b/i, /\\bcontact\\b/i, /\\bblog\\b/i, /\\bnews\\b/i,
+            /\\.(?:pdf|jpe?g|png|webp|gif|svg|ico|css|js)$/i
+        ];
+        const candidates = unique.filter(u => {
+            try {
+                const path = new URL(u).pathname.toLowerCase();
+                if (path === '/' || path === '') return false;
+                return !boilerplatePatterns.some(p => p.test(path));
+            } catch { return false; }
         });
+
+        // Service page patterns — preferred order: therapy/clinical specifics
+        // first, generic 'service' last (so we don't match '/terms-of-service'
+        // on sites that don't have a real services page). Boilerplate filter
+        // above already removes /terms-of-service, but ordering still helps
+        // when multiple paths match.
+        const servicePatterns = [
+            /\\btherapy\\b/i, /\\bcounsel(ing|or|ling)?\\b/i, /\\btreatment\\b/i,
+            /\\bemdr\\b/i, /\\banxiety\\b/i, /\\bdepression\\b/i, /\\btrauma\\b/i,
+            /\\bptsd\\b/i, /\\bcouples?\\b/i, /\\bspecialt(y|ies)\\b/i,
+            /\\bservices?\\b/i  // generic — last
+        ];
+        let service = null;
+        for (const pat of servicePatterns) {
+            service = candidates.find(u => pat.test(new URL(u).pathname.toLowerCase()));
+            if (service) break;
+        }
 
         // About page patterns
-        const aboutPatterns = [/about/i, /bio/i, /team/i, /therapist/i, /staff/i, /clinician/i, /meet/i, /our-/i];
-        const about = unique.find(u => {
-            const path = new URL(u).pathname.toLowerCase();
-            return path !== '/' && aboutPatterns.some(p => p.test(path));
-        });
+        const aboutPatterns = [
+            /\\babout\\b/i, /\\bbio\\b/i, /\\bteam\\b/i, /\\btherapist\\b/i,
+            /\\bclinician\\b/i, /\\bmeet\\b/i, /\\bstaff\\b/i, /\\bour-/i
+        ];
+        let about = null;
+        for (const pat of aboutPatterns) {
+            about = candidates.find(u => pat.test(new URL(u).pathname.toLowerCase()));
+            if (about) break;
+        }
 
-        return { service: service || null, about: about || null, all_links: unique.slice(0, 30) };
+        return { service: service || null, about: about || null, all_links: candidates.slice(0, 30) };
     }""", base_url)
 
     return links
