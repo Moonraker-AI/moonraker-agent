@@ -192,9 +192,16 @@ async def run_design_audit(
                 # Brief settle for fonts/post-paint.
                 await page.wait_for_timeout(800)
 
-                # Inject the detector. add_script_tag with content runs synchronously
-                # in document context, so window.impeccableScan is defined immediately.
-                await page.add_script_tag(content=detector_js)
+                # Inject the detector via evaluate() rather than add_script_tag.
+                # add_script_tag creates a <script> element in the DOM whose
+                # text content is the detector source. The detector contains
+                # the literal string "background-clip: text + gradient" (in its
+                # own snippet messages) — when its checkHtmlPatterns step
+                # scans documentElement.outerHTML, it finds those strings in
+                # its own injected <script> and reports gradient-text on
+                # every page. Using evaluate() executes the IIFE without
+                # leaving a <script> node behind.
+                await page.evaluate(detector_js)
 
                 # Fonts may still be loading. Wait briefly for document.fonts.ready
                 # so typography rules see actual rendered metrics.
