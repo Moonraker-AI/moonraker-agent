@@ -173,7 +173,12 @@ async def run_capture_design_assets(task_id, params, status_callback, env):
         callback_ok = False
         if callback_url and agent_api_key:
             try:
-                async with httpx.AsyncClient(timeout=30) as client:
+                # 2026-04-26: timeout bumped from 30s -> 90s. Client HQ's
+                # /api/ingest-design-assets now chains Claude-driven token
+                # distillation inline (analyze-design-spec). Capture upload +
+                # row update is fast (<1s) but the analyze step takes 10-30s,
+                # so the full callback can take up to ~45s on big sites.
+                async with httpx.AsyncClient(timeout=90) as client:
                     resp = await client.post(
                         callback_url,
                         json={
