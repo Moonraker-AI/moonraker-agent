@@ -298,16 +298,44 @@ async def capture_page(page, url, client_slug, page_type, extract_css=False):
         out["error"] = nav_err
         return out
 
-    # Screenshot
+    # Trigger lazy-loaded sections by stepping the viewport down the page
+    # before screenshotting. Many therapy sites use IntersectionObserver to
+    # mount hero images, testimonials, and team grids only when scrolled into
+    # view. Without this, full-page screenshots show large gray voids where
+    # those sections should be (skytherapies.ca was 12000px of mostly empty
+    # bands). Cap iterations so we never spin on infinite-scroll feeds.
+    try:
+        await page.evaluate("""async () => {
+            const distance = 800;
+            const max = 16000;  // hard upper bound on scroll depth probed
+            let y = 0;
+            while (y < max) {
+                window.scrollTo(0, y);
+                await new Promise(r => setTimeout(r, 120));
+                const h = document.documentElement.scrollHeight;
+                y += distance;
+                if (y >= h) break;
+            }
+            window.scrollTo(0, 0);
+            await new Promise(r => setTimeout(r, 400));
+        }""")
+    except Exception as e:
+        logger.info(f"lazy-load scroll skipped on {url}: {e}")
+
+    # Screenshot. Cap height at 4000px (after width-resize): hero + ~3
+    # sections is plenty for design-token analysis and yields a useable
+    # thumbnail in the admin Design Spec card. Full-page screenshots of
+    # therapy sites routinely run 8000-30000px tall, which gave us tall
+    # thin strips with mostly empty whitespace below the fold.
+    SCREENSHOT_MAX_H = 4000
     try:
         screenshot_bytes = await page.screenshot(full_page=True, type="png", timeout=20000)
         img = Image.open(io.BytesIO(screenshot_bytes))
         if img.width > 1440:
             ratio = 1440 / img.width
             img = img.resize((1440, int(img.height * ratio)), Image.LANCZOS)
-        # WebP max dimension is 16383px. Cap height to avoid encoding error.
-        if img.height > 12000:
-            img = img.crop((0, 0, img.width, 12000))
+        if img.height > SCREENSHOT_MAX_H:
+            img = img.crop((0, 0, img.width, SCREENSHOT_MAX_H))
         webp_buf = io.BytesIO()
         img.save(webp_buf, format="WEBP", quality=85)
         webp_bytes = webp_buf.getvalue()
