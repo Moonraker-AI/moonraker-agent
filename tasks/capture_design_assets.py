@@ -103,7 +103,10 @@ async def run_capture_design_assets(task_id, params, status_callback, env):
                     result["computed_css"] = homepage_data["css"]
                 if homepage_data.get("text"):
                     result["crawled_text"]["homepage"] = homepage_data["text"]
-                result["crawled_urls"]["homepage"] = website_url
+                # Record the post-redirect URL, not the input. Squarespace and
+                # many WP sites 301 the apex to www; storing the rendered URL
+                # makes the report match the actual scraped resource.
+                result["crawled_urls"]["homepage"] = page.url or website_url
             else:
                 result["capture_errors"]["homepage"] = homepage_data.get("error", "unknown error")
                 logger.error(f"Homepage capture failed: {homepage_data.get('error')}")
@@ -113,7 +116,15 @@ async def run_capture_design_assets(task_id, params, status_callback, env):
             if homepage_data.get("ok") and (not service_url or not about_url):
                 await status_callback(task_id, "running", "Discovering pages...")
                 try:
-                    links = await discover_pages(page, website_url)
+                    # Use the post-redirect URL as discovery base. Squarespace
+                    # 7.1 nav anchors are absolute URLs (e.g. www.<host>/about),
+                    # so when website_url is the apex (no www) the hostname
+                    # filter rejected every internal link and discovery
+                    # returned empty. page.url reflects the final landed URL,
+                    # so the hostname always matches the anchors the page
+                    # actually rendered.
+                    discovery_base = page.url or website_url
+                    links = await discover_pages(page, discovery_base)
                     if not service_url:
                         service_url = links.get("service", "")
                     if not about_url:
