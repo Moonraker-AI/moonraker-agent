@@ -74,11 +74,23 @@ logger = logging.getLogger("moonraker.sitemap_scout_stealth")
 
 # ── Tunables (stealth-specific) ─────────────────────────────────────────
 HARD_TIMEOUT_SECONDS = 90        # wall-clock cap for the whole scout
-NAV_TIMEOUT_MS = 20_000          # per page.goto() timeout
-WAIT_AFTER_NAV_MS = 1_500        # let Cloudflare challenge JS settle
+NAV_TIMEOUT_MS = 20_000          # per page.goto() timeout (sub-pages)
+ROOT_NAV_TIMEOUT_MS = 30_000     # per page.goto() timeout for the very
+                                 # first hit on the origin (CF / SiteGround
+                                 # `sg-captcha: challenge` JS interstitials
+                                 # commonly take 6-15s to clear)
+WAIT_AFTER_NAV_MS = 1_500        # generic settle after each sub-page load
+WAIT_AFTER_ROOT_NAV_MS = 4_000   # extra settle on the first paint so any
+                                 # WAF JS-challenge cookie gets minted before
+                                 # we ask for anchors
 CRAWL_MAX_PAGES = 200            # parity with Tier 1 MAX_CRAWL_PAGES
 CRAWL_MAX_DEPTH = 2              # spec asks for depth 2 (Tier 1 uses 3)
 SITEMAP_PROBE_PATHS = ("/sitemap.xml", "/sitemap_index.xml", "/robots.txt")
+# Signals an interstitial / WAF challenge response that we need to retry
+# with a longer settle. SiteGround returns 202 + `sg-captcha: challenge`
+# header. Cloudflare returns 403/503 with cf-mitigated. Both clear once
+# the JS challenge runs in the patchright-driven page.
+_INTERSTITIAL_STATUS = (202, 403, 503)
 
 
 # ── Browser fetch helpers ───────────────────────────────────────────────
@@ -352,20 +364,42 @@ async def _bounded_crawl_browser(page, root_url: str) -> list[str]:
 
     while queue and len(discovered) < CRAWL_MAX_PAGES:
         url, depth = queue.pop(0)
+        is_root = url == root_norm
 
         try:
             response = await page.goto(
-                url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS
+                url,
+                wait_until="domcontentloaded",
+                timeout=ROOT_NAV_TIMEOUT_MS if is_root else NAV_TIMEOUT_MS,
             )
-            if response is None or response.status >= 400:
-                logger.debug(
-                    f"stealth crawl skip {url}: "
-                    f"status={getattr(response, 'status', 'no-response')}"
-                )
+            if response is None:
+                logger.info(f"stealth crawl no-response {url}")
                 continue
-            await page.wait_for_timeout(WAIT_AFTER_NAV_MS)
+            status = response.status
+            await page.wait_for_timeout(
+                WAIT_AFTER_ROOT_NAV_MS if is_root else WAIT_AFTER_NAV_MS
+            )
+
+            # If the response status is a known WAF challenge code, give the
+            # JS interstitial more time to clear and verify we actually have
+            # markup before bailing out. SiteGround / CF challenges flip the
+            # document body to the real site only after their challenge JS
+            # mints a session cookie.
+            if status in _INTERSTITIAL_STATUS:
+                try:
+                    await page.wait_for_load_state(
+                        "networkidle", timeout=ROOT_NAV_TIMEOUT_MS
+                    )
+                except Exception:
+                    pass
+                # Extra grace for slow challenges (mcculloughfamilytherapy
+                # SiteGround sg-captcha is the canonical 202 case).
+                await page.wait_for_timeout(WAIT_AFTER_ROOT_NAV_MS)
+            elif status >= 400:
+                logger.info(f"stealth crawl skip {url}: status={status}")
+                continue
         except Exception as e:
-            logger.debug(f"stealth crawl nav error {url}: {e}")
+            logger.info(f"stealth crawl nav error {url}: {e}")
             continue
 
         # Don't expand beyond the depth cap, but still record THIS page.
@@ -373,6 +407,17 @@ async def _bounded_crawl_browser(page, root_url: str) -> list[str]:
             continue
 
         raw_hrefs = await _evaluate_rendered_links(page)
+        # If the first attempt found nothing, give the page another beat
+        # and re-query — single-page apps and WAF interstitials commonly
+        # finish painting after domcontentloaded.
+        if not raw_hrefs:
+            try:
+                await page.wait_for_load_state("networkidle", timeout=10_000)
+            except Exception:
+                pass
+            await page.wait_for_timeout(2_000)
+            raw_hrefs = await _evaluate_rendered_links(page)
+
         for href in raw_hrefs:
             normalized = _normalize_crawl_url(href, root_url)
             if normalized is None or normalized in visited:
@@ -383,9 +428,9 @@ async def _bounded_crawl_browser(page, root_url: str) -> list[str]:
                 break
             queue.append((normalized, depth + 1))
 
-        logger.debug(
-            f"stealth crawl depth={depth} url={url} -> "
-            f"{len(raw_hrefs)} raw hrefs, discovered={len(discovered)}"
+        logger.info(
+            f"stealth crawl depth={depth} url={url} status={status} "
+            f"-> {len(raw_hrefs)} raw hrefs, discovered={len(discovered)}"
         )
 
     return discovered
@@ -493,9 +538,21 @@ async def run_sitemap_scout_stealth(task_id, params, status_callback, env):
                 response = await page.goto(
                     root_url + "/",
                     wait_until="domcontentloaded",
-                    timeout=NAV_TIMEOUT_MS,
+                    timeout=ROOT_NAV_TIMEOUT_MS,
                 )
-                await page.wait_for_timeout(WAIT_AFTER_NAV_MS)
+                await page.wait_for_timeout(WAIT_AFTER_ROOT_NAV_MS)
+                # WAF-challenge aware: wait for networkidle once if status
+                # was an interstitial code so the real homepage paints.
+                hp_status = response.status if response else 0
+                if hp_status in _INTERSTITIAL_STATUS:
+                    try:
+                        await page.wait_for_load_state(
+                            "networkidle", timeout=ROOT_NAV_TIMEOUT_MS
+                        )
+                    except Exception:
+                        pass
+                    await page.wait_for_timeout(WAIT_AFTER_ROOT_NAV_MS)
+
                 # Tier 1 regex strategy first — works on most server-rendered
                 # therapy sites and yields a labelled nav_extraction_method
                 # so downstream UI can show "where the nav came from".
@@ -517,7 +574,8 @@ async def run_sitemap_scout_stealth(task_id, params, status_callback, env):
                 report["nav_extraction_method"] = nav_method or "unsupported"
                 logger.info(
                     f"stealth-sitemap {task_id[:12]} nav: "
-                    f"{report['nav_extraction_method']} -> {len(nav_urls)} link(s)"
+                    f"{report['nav_extraction_method']} (hp_status={hp_status}) "
+                    f"-> {len(nav_urls)} link(s)"
                 )
             except Exception as e:
                 report["nav_extraction_method"] = "unsupported"
