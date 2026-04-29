@@ -34,6 +34,7 @@ from tasks.wp_scout import run_wp_scout
 from tasks.sq_scout import run_sq_scout
 from tasks.wix_scout import run_wix_scout
 from tasks.sitemap_scout import run_sitemap_scout
+from tasks.sitemap_scout_stealth import run_sitemap_scout_stealth
 from tasks.surge_status_check import check_surge_status
 from tasks.design_audit import run_design_audit
 
@@ -51,7 +52,7 @@ logger = logging.getLogger("agent")
 from utils.log_redact import install as _install_log_redact
 _install_log_redact()
 
-AGENT_VERSION = "0.7.1"
+AGENT_VERSION = "0.7.2"
 
 app = FastAPI(
     title="Moonraker Agent Service",
@@ -278,6 +279,18 @@ class WixScoutRequest(BaseModel):
 
 
 class SitemapScoutRequest(BaseModel):
+    root_url: str
+    client_slug: Optional[str] = None
+    callback_url: Optional[str] = None
+
+    _v_root = field_validator("root_url")(classmethod(lambda cls, v: _validate_http_url(v)))
+    _v_callback = field_validator("callback_url")(classmethod(lambda cls, v: _validate_optional_http_url(v)))
+
+
+class SitemapScoutStealthRequest(BaseModel):
+    """Tier 2 sitemap scout — Patchright-driven sibling of
+    SitemapScoutRequest. Same body shape so CHQ can switch between the two
+    paths via a `mode` flag without changing payload."""
     root_url: str
     client_slug: Optional[str] = None
     callback_url: Optional[str] = None
@@ -626,6 +639,38 @@ async def create_sitemap_scout(request: SitemapScoutRequest):
     asyncio.create_task(_run_sitemap_scout_no_lock(task_id))
     logger.info(
         f"Queued sitemap scout {task_id[:12]} for '{request.root_url}'"
+    )
+
+    return {"task_id": task_id, "status": "queued"}
+
+@app.post("/tasks/sitemap-scout-stealth", dependencies=[Depends(verify_api_key)])
+async def create_sitemap_scout_stealth(request: SitemapScoutStealthRequest):
+    """Tier 2 sitemap scout — drives Patchright-stealth Chromium so it can
+    bypass Cloudflare/WAF 202 challenges that block plain-HTTP probes.
+
+    Holds browser_lock (one chromium at a time, 4GB RAM ceiling). Hard
+    timeout: 90s wall-clock per site. Same callback payload shape as
+    /tasks/sitemap-scout, with `tier: "stealth"` set on the report so
+    observability can split metrics."""
+    task_id = f"sitemap-stealth-{uuid.uuid4()}"
+    now = datetime.now(timezone.utc).isoformat()
+
+    tasks[task_id] = {
+        "task_id": task_id,
+        "type": "sitemap-scout-stealth",
+        "status": "queued",
+        "message": "Sitemap scout (stealth) queued",
+        "created_at": now,
+        "updated_at": now,
+        "error": None,
+        "duration_seconds": None,
+        "request": request.model_dump(),
+        "result": None,
+    }
+
+    asyncio.create_task(_run_sitemap_scout_stealth_with_lock(task_id))
+    logger.info(
+        f"Queued stealth sitemap scout {task_id[:12]} for '{request.root_url}'"
     )
 
     return {"task_id": task_id, "status": "queued"}
@@ -1034,3 +1079,35 @@ async def _run_sitemap_scout_no_lock(task_id: str):
     except Exception as e:
         logger.exception(f"Sitemap scout {task_id[:12]} failed")
         update_task(task_id, "error", f"Scout failed: {str(e)[:200]}", error=str(e))
+
+
+async def _run_sitemap_scout_stealth_with_lock(task_id: str):
+    """Tier 2 (Browser Lock): Patchright-driven sitemap scout for sites
+    behind Cloudflare/WAF. One chromium at a time — shared browser_lock
+    with Surge audits to keep RSS under the 4GB compose limit (a parallel
+    Surge audit + stealth scout has historically OOM-killed the container,
+    see /var/log/syslog 2026-04-12).
+
+    Light cooldown after — the scout is short (≤90s) and tears the
+    browser down cleanly in its own finally block."""
+    async with browser_lock:
+        update_task(task_id, "running", "Starting sitemap scout (stealth)")
+        try:
+            env = {
+                "AGENT_API_KEY": os.getenv("AGENT_API_KEY", ""),
+                "ANTHROPIC_API_KEY": os.getenv("ANTHROPIC_API_KEY", ""),
+            }
+            result = await run_sitemap_scout_stealth(
+                task_id=task_id,
+                params=tasks[task_id]["request"],
+                status_callback=_async_update_task,
+                env=env,
+            )
+            if task_id in tasks and result:
+                tasks[task_id]["result"] = result
+        except Exception as e:
+            logger.exception(f"Stealth sitemap scout {task_id[:12]} failed")
+            update_task(task_id, "error", f"Scout failed: {str(e)[:200]}", error=str(e))
+
+        logger.info(f"Post-task cooldown: {LIGHT_TASK_COOLDOWN}s")
+        await asyncio.sleep(LIGHT_TASK_COOLDOWN)
