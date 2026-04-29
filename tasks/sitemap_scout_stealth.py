@@ -349,7 +349,7 @@ def _normalize_crawl_url(href: str, root_url: str) -> str | None:
     return absolute.rstrip("/")
 
 
-async def _bounded_crawl_browser(page, root_url: str) -> list[str]:
+async def _bounded_crawl_browser(page, root_url: str) -> tuple[list[str], int]:
     """BFS crawl rendered DOM. Same-origin only, capped at CRAWL_MAX_PAGES
     URLs and CRAWL_MAX_DEPTH levels.
 
@@ -357,11 +357,20 @@ async def _bounded_crawl_browser(page, root_url: str) -> list[str]:
     rather than regex on raw HTML so JS-rendered nav and CF-injected page
     bodies are visible. The browser resolves relative hrefs against the
     document's baseURI for us.
+
+    Returns:
+        (discovered_urls, root_raw_href_count)
+
+    `root_raw_href_count` is the number of <a href> entries that
+    `document.querySelectorAll('a[href]')` returned for the depth-0 fetch
+    of `root_url`. The main flow uses this to detect WAF soft-blocks and
+    JS-heavy SPA placeholder DOMs (0 hrefs -> target_blocked hint).
     """
     root_norm = root_url.rstrip("/")
     visited: set[str] = {root_norm}
     discovered: list[str] = [root_norm]
     queue: list[tuple[str, int]] = [(root_norm, 0)]
+    root_raw_href_count: int = 0
 
     while queue and len(discovered) < CRAWL_MAX_PAGES:
         url, depth = queue.pop(0)
@@ -423,6 +432,14 @@ async def _bounded_crawl_browser(page, root_url: str) -> list[str]:
             await page.wait_for_timeout(2_000)
             raw_hrefs = await _evaluate_rendered_links(page)
 
+        # Capture the depth-0 raw href count so the main flow can detect
+        # WAF soft-blocks / JS-SPA placeholder DOMs cleanly. This is the
+        # signal we already log as "0 raw hrefs" — surfacing it lets us
+        # set status_hint=target_blocked instead of returning a misleading
+        # "complete with 1 page" result.
+        if is_root:
+            root_raw_href_count = len(raw_hrefs or [])
+
         for href in raw_hrefs:
             normalized = _normalize_crawl_url(href, root_url)
             if normalized is None or normalized in visited:
@@ -438,7 +455,7 @@ async def _bounded_crawl_browser(page, root_url: str) -> list[str]:
             f"-> {len(raw_hrefs)} raw hrefs, discovered={len(discovered)}"
         )
 
-    return discovered
+    return discovered, root_raw_href_count
 
 
 # ── Main entry point ────────────────────────────────────────────────────
@@ -570,6 +587,12 @@ async def run_sitemap_scout_stealth(task_id, params, status_callback, env):
             sitemap_urls, source = await _discover_sitemap_via_browser(page, root_url)
 
             urls: list[str] = []
+            # Tracks how many raw <a href> entries the depth-0 crawl saw on
+            # root_url. -1 means "we never ran the crawl path" (sitemap was
+            # found and walked instead). 0 means the crawl ran and the page
+            # rendered an empty/placeholder DOM — the canonical WAF soft-
+            # block signal.
+            root_raw_href_count: int = -1
             if sitemap_urls:
                 report["sitemap_source"] = source
                 await status_callback(task_id, "running", f"Walking {len(sitemap_urls)} sitemap(s)...")
@@ -578,8 +601,11 @@ async def run_sitemap_scout_stealth(task_id, params, status_callback, env):
             else:
                 report["sitemap_source"] = "crawl"
                 await status_callback(task_id, "running", "No sitemap, rendered crawl...")
-                urls = await _bounded_crawl_browser(page, root_url)
-                logger.info(f"stealth-sitemap {task_id[:12]}: crawl -> {len(urls)} URLs")
+                urls, root_raw_href_count = await _bounded_crawl_browser(page, root_url)
+                logger.info(
+                    f"stealth-sitemap {task_id[:12]}: crawl -> {len(urls)} URLs "
+                    f"(root_raw_hrefs={root_raw_href_count})"
+                )
 
             # ── Step 2: Extract nav from homepage (rendered DOM) ─────
             try:
@@ -645,6 +671,40 @@ async def run_sitemap_scout_stealth(task_id, params, status_callback, env):
                     uniq_urls.append(u)
 
             report["total_pages"] = len(uniq_urls)
+
+            # ── Soft-block detection ───────────────────────────────────
+            # Surface "Patchright reached the page but got nothing useful"
+            # as a status_hint so CHQ can branch on it. Three conditions
+            # must all be true:
+            #   1. We fell to the crawl path (no sitemap.xml / robots
+            #      sitemap discovered).
+            #   2. The depth-0 fetch on root_url returned 0 raw hrefs from
+            #      `document.querySelectorAll('a[href]')` — the canonical
+            #      signal for WAF soft-blocks (sg-captcha that never
+            #      cleared, CF challenge that swallowed the body) and
+            #      JS-heavy SPAs that paint a placeholder shell with no
+            #      anchors.
+            #   3. Final categorized total_pages <= 1 (i.e. only the
+            #      root_url itself made it through, which is meaningless
+            #      for a real audit).
+            # We do NOT change `total_pages` or the overall task status —
+            # CHQ ingest reads `status_hint` and writes
+            # `sitemap_scouts.status='blocked'` separately.
+            if (
+                report["sitemap_source"] == "crawl"
+                and root_raw_href_count == 0
+                and report["total_pages"] <= 1
+            ):
+                report["status_hint"] = "target_blocked"
+                report["errors"].append(
+                    "Patchright reached the page but the rendered DOM "
+                    "exposed 0 internal links (WAF soft-block or JS-heavy "
+                    "SPA — manual sitemap entry required)"
+                )
+                logger.info(
+                    f"stealth-sitemap {task_id[:12]} status_hint=target_blocked "
+                    f"(crawl, 0 raw hrefs, total_pages={report['total_pages']})"
+                )
 
             await status_callback(task_id, "running", f"Categorizing {len(uniq_urls)} URLs...")
             categorized: dict[str, list[str]] = {}
