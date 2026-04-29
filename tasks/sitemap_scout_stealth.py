@@ -98,9 +98,10 @@ _INTERSTITIAL_STATUS = (202, 403, 503)
 async def _browser_fetch_text(page, url: str) -> tuple[int, str]:
     """Navigate to `url` via the browser context and return (status, body).
 
-    The first navigation against a Cloudflare-protected origin tends to land
-    on a 202 challenge page; the patchright driver passes the JS check and
-    sets `cf_clearance` automatically. Subsequent calls reuse that cookie.
+    Uses `wait_until="load"` so that meta-refresh / JS-redirect challenge
+    chains (Cloudflare IUAM, SiteGround sg-captcha) follow through to the
+    actual content. Once the warm-up step has minted the WAF session cookie,
+    each call here resolves with status 200 and the real body.
 
     For XML / robots.txt responses Chrome shows an inline pretty-printer
     rather than the raw text. We pull the raw bytes off the response object
@@ -108,7 +109,7 @@ async def _browser_fetch_text(page, url: str) -> tuple[int, str]:
     """
     try:
         response = await page.goto(
-            url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS
+            url, wait_until="load", timeout=NAV_TIMEOUT_MS
         )
     except Exception as e:
         logger.debug(f"stealth fetch nav error {url}: {e}")
@@ -119,7 +120,7 @@ async def _browser_fetch_text(page, url: str) -> tuple[int, str]:
 
     status = response.status
 
-    # Brief settle so any Cloudflare interstitial JS finishes.
+    # Brief settle so any interstitial JS finishes.
     try:
         await page.wait_for_timeout(WAIT_AFTER_NAV_MS)
     except Exception:
@@ -367,9 +368,13 @@ async def _bounded_crawl_browser(page, root_url: str) -> list[str]:
         is_root = url == root_norm
 
         try:
+            # `wait_until="load"` follows meta-refresh / JS challenge
+            # redirects through to the final page. Important for sites
+            # behind sg-captcha / IUAM where domcontentloaded fires on
+            # the interstitial stub.
             response = await page.goto(
                 url,
-                wait_until="domcontentloaded",
+                wait_until="load",
                 timeout=ROOT_NAV_TIMEOUT_MS if is_root else NAV_TIMEOUT_MS,
             )
             if response is None:
@@ -517,6 +522,49 @@ async def run_sitemap_scout_stealth(task_id, params, status_callback, env):
             page = await context.new_page()
             page.set_default_timeout(NAV_TIMEOUT_MS)
 
+            # ── Step 0: Warm-up — solve any WAF interstitial up-front ─
+            # SiteGround's sg-captcha and Cloudflare's IUAM both work via a
+            # JS-challenge -> redirect chain. We need to hit the origin once
+            # with `wait_until="load"` (which follows meta-refresh and JS
+            # navigations to completion) so the WAF mints its session cookie.
+            # All subsequent /sitemap.xml + crawl probes then arrive with the
+            # cookie set and bypass the challenge cleanly.
+            await status_callback(task_id, "running", "Warming up stealth session...")
+            try:
+                warmup = await page.goto(
+                    root_url + "/",
+                    wait_until="load",
+                    timeout=ROOT_NAV_TIMEOUT_MS,
+                )
+                await page.wait_for_timeout(WAIT_AFTER_ROOT_NAV_MS)
+                # If the warm-up still landed on a challenge code, give it a
+                # second beat in case the challenge JS is mid-execution.
+                if warmup is not None and warmup.status in _INTERSTITIAL_STATUS:
+                    try:
+                        await page.wait_for_load_state(
+                            "networkidle", timeout=ROOT_NAV_TIMEOUT_MS
+                        )
+                    except Exception:
+                        pass
+                    await page.wait_for_timeout(WAIT_AFTER_ROOT_NAV_MS)
+                    # And try one more `goto load` — challenge cookie should
+                    # now be present so this resolves to the real page.
+                    try:
+                        warmup = await page.goto(
+                            root_url + "/",
+                            wait_until="load",
+                            timeout=ROOT_NAV_TIMEOUT_MS,
+                        )
+                        await page.wait_for_timeout(WAIT_AFTER_NAV_MS)
+                    except Exception as e:
+                        logger.info(f"stealth warmup retry failed: {e}")
+                logger.info(
+                    f"stealth-sitemap {task_id[:12]} warmup status="
+                    f"{getattr(warmup, 'status', 'no-response')}"
+                )
+            except Exception as e:
+                logger.info(f"stealth-sitemap {task_id[:12]} warmup error: {e}")
+
             # ── Step 1: Sitemap discovery via browser ──────────────────
             await status_callback(task_id, "running", "Discovering sitemap (stealth)...")
             sitemap_urls, source = await _discover_sitemap_via_browser(page, root_url)
@@ -537,7 +585,7 @@ async def run_sitemap_scout_stealth(task_id, params, status_callback, env):
             try:
                 response = await page.goto(
                     root_url + "/",
-                    wait_until="domcontentloaded",
+                    wait_until="load",
                     timeout=ROOT_NAV_TIMEOUT_MS,
                 )
                 await page.wait_for_timeout(WAIT_AFTER_ROOT_NAV_MS)
