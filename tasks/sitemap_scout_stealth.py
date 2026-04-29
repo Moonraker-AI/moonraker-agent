@@ -234,9 +234,117 @@ def _extract_anchor_hrefs(html: str, page_url: str, root_url: str) -> list[str]:
     return out
 
 
+_NON_HTML_EXT_RE = re.compile(
+    r"\.(pdf|jpg|jpeg|png|gif|webp|svg|zip|css|js|ico|mp4|mp3|woff2?|ttf|eot)(\?|$)",
+    re.IGNORECASE,
+)
+
+
+async def _evaluate_rendered_links(page) -> list[str]:
+    """Pull every <a href> off the rendered DOM via Patchright's
+    `page.evaluate`. This is the form the task spec calls out — it survives
+    JS-rendered nav (Wix, Squarespace, lazy-loaded CF challenge bridges)
+    that the raw-HTML regex misses.
+
+    Returns a list of resolved absolute URLs (browser already resolves
+    relative hrefs against document.baseURI). Caller filters same-origin /
+    dedupes."""
+    try:
+        return await page.evaluate(
+            "() => Array.from(document.querySelectorAll('a[href]')).map(a => a.href)"
+        )
+    except Exception as e:
+        logger.debug(f"stealth crawl evaluate failed: {e}")
+        return []
+
+
+_DOM_NAV_SELECTORS_JS = """
+() => {
+  const selectors = [
+    'nav a[href]',
+    'header a[href]',
+    '[role="navigation"] a[href]',
+    '.menu a[href]',
+    '.main-menu a[href]',
+    '.primary-menu a[href]',
+    '.site-nav a[href]',
+    '.navbar a[href]',
+    '.nav a[href]',
+    '#main-menu a[href]',
+    '#primary-menu a[href]',
+    '#site-navigation a[href]',
+  ];
+  const out = [];
+  const seen = new Set();
+  for (const sel of selectors) {
+    let nodes;
+    try { nodes = document.querySelectorAll(sel); } catch (_) { continue; }
+    for (const n of nodes) {
+      const href = n.href;
+      if (!href || seen.has(href)) continue;
+      seen.add(href);
+      out.push(href);
+    }
+  }
+  return out;
+}
+"""
+
+
+async def _evaluate_dom_nav_links(page, root_url: str) -> list[str]:
+    """Return a deduped list of same-origin nav URLs by querying the
+    rendered DOM for `<nav>`, `<header>`, and common menu container
+    selectors. Mirrors Tier 1's regex strategy but works against rendered
+    DOM, so it captures JS-only nav implementations."""
+    try:
+        raw = await page.evaluate(_DOM_NAV_SELECTORS_JS)
+    except Exception as e:
+        logger.debug(f"stealth nav dom evaluate failed: {e}")
+        return []
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for href in raw or []:
+        normalized = _normalize_crawl_url(href, root_url)
+        if normalized is None or normalized in seen:
+            continue
+        seen.add(normalized)
+        out.append(normalized)
+    # Tier 1 only considers nav credible when ≥ 2 links are found; honour
+    # the same threshold so downstream consumers don't ingest noise.
+    return out if len(out) >= 2 else []
+
+
+def _normalize_crawl_url(href: str, root_url: str) -> str | None:
+    """Apply same-origin + fragment + query-strip filtering used during the
+    BFS. Returns the canonical URL or None if it should be skipped."""
+    if not href:
+        return None
+    if href.startswith(("javascript:", "mailto:", "tel:", "data:", "#")):
+        return None
+    try:
+        absolute, _ = urldefrag(href)
+    except Exception:
+        return None
+    absolute = absolute.split("?", 1)[0]
+    if not absolute.lower().startswith(("http://", "https://")):
+        return None
+    if not _same_origin(absolute, root_url):
+        return None
+    if _NON_HTML_EXT_RE.search(absolute):
+        return None
+    return absolute.rstrip("/")
+
+
 async def _bounded_crawl_browser(page, root_url: str) -> list[str]:
     """BFS crawl rendered DOM. Same-origin only, capped at CRAWL_MAX_PAGES
-    URLs and CRAWL_MAX_DEPTH levels."""
+    URLs and CRAWL_MAX_DEPTH levels.
+
+    Uses `page.evaluate("Array.from(document.querySelectorAll('a[href]'))...")
+    rather than regex on raw HTML so JS-rendered nav and CF-injected page
+    bodies are visible. The browser resolves relative hrefs against the
+    document's baseURI for us.
+    """
     root_norm = root_url.rstrip("/")
     visited: set[str] = {root_norm}
     discovered: list[str] = [root_norm]
@@ -244,29 +352,41 @@ async def _bounded_crawl_browser(page, root_url: str) -> list[str]:
 
     while queue and len(discovered) < CRAWL_MAX_PAGES:
         url, depth = queue.pop(0)
-        if depth >= CRAWL_MAX_DEPTH:
-            continue
 
         try:
             response = await page.goto(
                 url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS
             )
             if response is None or response.status >= 400:
+                logger.debug(
+                    f"stealth crawl skip {url}: "
+                    f"status={getattr(response, 'status', 'no-response')}"
+                )
                 continue
             await page.wait_for_timeout(WAIT_AFTER_NAV_MS)
-            html = await page.content()
         except Exception as e:
-            logger.debug(f"stealth crawl error {url}: {e}")
+            logger.debug(f"stealth crawl nav error {url}: {e}")
             continue
 
-        for href in _extract_anchor_hrefs(html, url, root_url):
-            if href in visited:
+        # Don't expand beyond the depth cap, but still record THIS page.
+        if depth >= CRAWL_MAX_DEPTH:
+            continue
+
+        raw_hrefs = await _evaluate_rendered_links(page)
+        for href in raw_hrefs:
+            normalized = _normalize_crawl_url(href, root_url)
+            if normalized is None or normalized in visited:
                 continue
-            visited.add(href)
-            discovered.append(href)
+            visited.add(normalized)
+            discovered.append(normalized)
             if len(discovered) >= CRAWL_MAX_PAGES:
                 break
-            queue.append((href, depth + 1))
+            queue.append((normalized, depth + 1))
+
+        logger.debug(
+            f"stealth crawl depth={depth} url={url} -> "
+            f"{len(raw_hrefs)} raw hrefs, discovered={len(discovered)}"
+        )
 
     return discovered
 
@@ -368,7 +488,7 @@ async def run_sitemap_scout_stealth(task_id, params, status_callback, env):
                 urls = await _bounded_crawl_browser(page, root_url)
                 logger.info(f"stealth-sitemap {task_id[:12]}: crawl -> {len(urls)} URLs")
 
-            # ── Step 2: Extract nav from homepage (rendered HTML) ─────
+            # ── Step 2: Extract nav from homepage (rendered DOM) ─────
             try:
                 response = await page.goto(
                     root_url + "/",
@@ -376,16 +496,29 @@ async def run_sitemap_scout_stealth(task_id, params, status_callback, env):
                     timeout=NAV_TIMEOUT_MS,
                 )
                 await page.wait_for_timeout(WAIT_AFTER_NAV_MS)
+                # Tier 1 regex strategy first — works on most server-rendered
+                # therapy sites and yields a labelled nav_extraction_method
+                # so downstream UI can show "where the nav came from".
                 hp_html = await page.content() if response else ""
+                nav_urls, nav_method = ([], "unsupported")
                 if hp_html:
                     nav_urls, nav_method = _extract_nav_urls(hp_html, root_url)
-                    report["nav_urls"] = nav_urls
-                    report["nav_extraction_method"] = nav_method
-                    logger.info(
-                        f"stealth-sitemap {task_id[:12]} nav: {nav_method} -> {len(nav_urls)} link(s)"
-                    )
-                else:
-                    report["nav_extraction_method"] = "unsupported"
+
+                # Fallback: query the rendered DOM for <nav>, <header>, and
+                # common menu containers. Captures Wix / Squarespace /
+                # JS-rendered navs that the regex misses.
+                if not nav_urls:
+                    dom_nav = await _evaluate_dom_nav_links(page, root_url)
+                    if dom_nav:
+                        nav_urls = dom_nav
+                        nav_method = "dom_nav"
+
+                report["nav_urls"] = nav_urls
+                report["nav_extraction_method"] = nav_method or "unsupported"
+                logger.info(
+                    f"stealth-sitemap {task_id[:12]} nav: "
+                    f"{report['nav_extraction_method']} -> {len(nav_urls)} link(s)"
+                )
             except Exception as e:
                 report["nav_extraction_method"] = "unsupported"
                 report["errors"].append(f"nav extraction failed: {e}")
