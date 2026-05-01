@@ -8,8 +8,19 @@ re-extraction with the dual-pane parser path.
 Lighter than surge_audit.py:
   - No new Surge run (free, doesn't burn credits)
   - No Phase 2 wait
-  - Reuses login + clipboard-intercept patterns from surge_audit.py
+  - Reuses utils.surge_run_extract for login + per-tab clipboard extraction
   - Captures TWO tabs: Diagnosis and Action plan (skips Opportunities — redundant)
+
+Implementation note: this task uses raw Playwright (via async_playwright)
+rather than Browser-Use, because:
+  1. Browser-Use's Page wrapper exposes only goto/evaluate/screenshot —
+     no wait_for_selector/fill/locator. Manual login requires those.
+  2. clipboard-read permission must be granted at the BrowserContext
+     level, which surge_run_extract already does via
+     pw.chromium.launch().new_context(permissions=[...]).
+  3. The shared _login + _extract_one_run helpers in utils/surge_run_extract
+     already implement the exact tab-walk we need; reusing them avoids
+     selector duplication.
 
 Used to enrich the 65 active clients whose original audits captured only
 the Diagnosis pane. After rehydration:
@@ -22,15 +33,14 @@ the Diagnosis pane. After rehydration:
 import asyncio
 import logging
 import os
-from typing import Callable
+import re
+from typing import Callable, Optional
 
 import httpx
-from browser_use import Browser
+from playwright.async_api import async_playwright
 
-from utils.debug_capture import capture_debug
-from utils.supabase_patch import (
-    patch_audit_retriable,
-)
+from utils.supabase_patch import patch_audit_retriable
+from utils.surge_run_extract import _login
 
 logger = logging.getLogger("agent.surge_rehydrate")
 
@@ -47,7 +57,6 @@ MIN_DIAGNOSIS_CHARS = 50_000
 MIN_ACTION_PLAN_CHARS = 20_000
 
 CALLBACK_TIMEOUT_SEC = 600
-TAB_SETTLE_SEC = 3
 
 
 async def execute_surge_rehydrate(
@@ -57,15 +66,13 @@ async def execute_surge_rehydrate(
 ):
     """
     Rehydration lifecycle:
-      1. Login to Surge (raw DOM fill, zero LLM)
-      2. Open History tab on dashboard
-      3. Find audit row matching practice_name + audit_date
-      4. Click into the audit detail
-      5. Diagnosis tab → click "Copy raw text" → capture clipboard
-      6. Action plan tab → click "Copy raw text" → capture clipboard
-      7. Validate min char floors
-      8. POST { audit_id, surge_raw_diagnosis, surge_raw_action_plan, rehydrate: true }
-         to Client HQ /api/process-entity-audit
+      1. Launch fresh Playwright + login to Surge
+      2. Navigate to history listing
+      3. Find audit row matching practice_name + audit_date, extract run_url
+      4. Reuse _extract_one_run() for tab-walk Diagnosis + Action plan capture
+      5. Validate min char floors
+      6. POST { audit_id, surge_raw_diagnosis, surge_raw_action_plan,
+                rehydrate: true } to /api/process-entity-audit
     """
     req = tasks[task_id]["request"]
     audit_id = req["audit_id"]
@@ -73,192 +80,306 @@ async def execute_surge_rehydrate(
     audit_date = req.get("audit_date")
     client_slug = req["client_slug"]
 
-    browser = None
-    page = None
+    if not SURGE_EMAIL or not SURGE_PASSWORD:
+        return await _fail_retriable(
+            task_id, audit_id, update_task, None,
+            "missing_credentials",
+            "SURGE_EMAIL/SURGE_PASSWORD not configured on agent"
+        )
 
     try:
-        update_task(task_id, "login", "Launching browser and logging into Surge")
-        browser = Browser(
-            keep_alive=True,
-            headless=True,
-            disable_security=True,  # clipboard access
-            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
-        )
-        # Browser-Use 0.12.x: must explicitly start the browser before
-        # new_page(). Skipping start() raises
-        # "CDP client not initialized - browser may not be connected yet".
-        await browser.start()
-        page = await browser.new_page()
-
-        await page.goto(f"{SURGE_URL}/login")
-        await page.wait_for_selector('input[type="email"]', timeout=30000)
-        await page.fill('input[type="email"]', SURGE_EMAIL)
-        await page.fill('input[type="password"]', SURGE_PASSWORD)
-        await page.click('button[type="submit"]')
-        await page.wait_for_url("**/dashboard**", timeout=60000)
-
-        update_task(task_id, "history", "Opening Surge history")
-        # NOTE: selectors below are best-effort. Verify against the live
-        # Surge UI (https://www.surgeaiprotocol.com/dashboard). If they
-        # drift, capture a screenshot via capture_debug for diagnosis.
-        try:
-            await page.click('text=History', timeout=15000)
-        except Exception:
-            await page.click('a[href*="history"]', timeout=15000)
-        await asyncio.sleep(2)
-
-        update_task(task_id, "finding_audit",
-                    f"Locating history row for {practice_name}" +
-                    (f" on {audit_date}" if audit_date else ""))
-
-        # Match by practice name (Surge typically lists brand/URL per row).
-        # If multiple history entries match the brand, prefer the row whose
-        # date matches audit_date.
-        match_clicked = False
-        try:
-            rows = await page.locator(f'tr:has-text("{practice_name}")').all()
-            if not rows:
-                rows = await page.locator(f'[role="row"]:has-text("{practice_name}")').all()
-            if not rows:
-                # Fallback: text match on link/cell
-                rows = await page.locator(f'text="{practice_name}"').all()
-
-            chosen = None
-            if audit_date and rows:
-                for r in rows:
-                    txt = (await r.text_content()) or ""
-                    if audit_date in txt or audit_date.replace("-", "/") in txt:
-                        chosen = r
-                        break
-            if not chosen and rows:
-                chosen = rows[0]
-
-            if chosen:
-                await chosen.click()
-                match_clicked = True
-                await asyncio.sleep(TAB_SETTLE_SEC)
-        except Exception as e:
-            logger.warning(f"History row match failed: {e}")
-
-        if not match_clicked:
-            return await _fail_retriable(
-                task_id, audit_id, update_task, page,
-                "history_row_not_found",
-                f"Could not locate a Surge history row for '{practice_name}'"
-                + (f" on {audit_date}" if audit_date else "")
+        async with async_playwright() as pw:
+            browser = await pw.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                ],
             )
+            try:
+                ctx = await browser.new_context(
+                    permissions=["clipboard-read", "clipboard-write"],
+                )
+                page = await ctx.new_page()
 
-        # Capture Diagnosis
-        update_task(task_id, "extracting_diagnosis", "Copying Diagnosis tab")
-        diagnosis_text = await _capture_tab(page, tab_label="Diagnosis")
-        if not diagnosis_text or len(diagnosis_text) < MIN_DIAGNOSIS_CHARS:
-            return await _fail_retriable(
-                task_id, audit_id, update_task, page,
-                "diagnosis_pane_short",
-                f"Diagnosis returned {len(diagnosis_text or '')} chars, "
-                f"minimum {MIN_DIAGNOSIS_CHARS}"
-            )
-        logger.info(f"Diagnosis captured: {len(diagnosis_text):,} chars")
+                update_task(task_id, "login", "Logging into Surge")
+                await _login(page, SURGE_URL, SURGE_EMAIL, SURGE_PASSWORD)
 
-        # Capture Action plan
-        update_task(task_id, "extracting_action_plan", "Copying Action plan tab")
-        action_plan_text = await _capture_tab(page, tab_label="Action plan")
-        if not action_plan_text or len(action_plan_text) < MIN_ACTION_PLAN_CHARS:
-            return await _fail_retriable(
-                task_id, audit_id, update_task, page,
-                "action_plan_pane_short",
-                f"Action plan returned {len(action_plan_text or '')} chars, "
-                f"minimum {MIN_ACTION_PLAN_CHARS}"
-            )
-        logger.info(f"Action plan captured: {len(action_plan_text):,} chars")
+                update_task(task_id, "history", "Opening Surge history")
+                run_url = await _find_run_url(page, practice_name, audit_date)
+                if not run_url:
+                    return await _fail_retriable(
+                        task_id, audit_id, update_task, page,
+                        "history_row_not_found",
+                        f"Could not locate a Surge history run for "
+                        f"'{practice_name}'"
+                        + (f" on {audit_date}" if audit_date else "")
+                    )
 
-        # Callback to CHQ
-        update_task(task_id, "callback",
-                    f"Sending {len(diagnosis_text):,} + {len(action_plan_text):,} chars to Client HQ")
-        async with httpx.AsyncClient(timeout=CALLBACK_TIMEOUT_SEC) as client:
-            resp = await client.post(
-                f"{CLIENT_HQ_URL}/api/process-entity-audit",
-                headers={
-                    "Content-Type": "application/json",
-                    "Authorization": f"Bearer {AGENT_API_KEY}",
-                },
-                json={
-                    "audit_id": audit_id,
-                    "surge_raw_diagnosis": diagnosis_text,
-                    "surge_raw_action_plan": action_plan_text,
-                    "rehydrate": True,
-                    "rehydration_source": "history_scrape",
-                },
-            )
-            if resp.status_code >= 400:
-                return await _fail_retriable(
-                    task_id, audit_id, update_task, page,
-                    "callback_error",
-                    f"CHQ returned {resp.status_code}: {resp.text[:300]}"
+                logger.info(f"Rehydrate match: {run_url}")
+                update_task(task_id, "extracting",
+                            f"Walking Diagnosis + Action plan tabs at {run_url}")
+
+                diagnosis_text, action_plan_text = await _walk_run_panes(page, run_url)
+
+                if len(diagnosis_text) < MIN_DIAGNOSIS_CHARS:
+                    return await _fail_retriable(
+                        task_id, audit_id, update_task, page,
+                        "diagnosis_pane_short",
+                        f"Diagnosis returned {len(diagnosis_text)} chars, "
+                        f"minimum {MIN_DIAGNOSIS_CHARS}"
+                    )
+                if len(action_plan_text) < MIN_ACTION_PLAN_CHARS:
+                    return await _fail_retriable(
+                        task_id, audit_id, update_task, page,
+                        "action_plan_pane_short",
+                        f"Action plan returned {len(action_plan_text)} chars, "
+                        f"minimum {MIN_ACTION_PLAN_CHARS}"
+                    )
+                logger.info(
+                    f"Captured panes: diagnosis={len(diagnosis_text):,}, "
+                    f"action_plan={len(action_plan_text):,}"
                 )
 
-        update_task(
-            task_id, "complete",
-            f"Rehydrated {practice_name}: "
-            f"{len(diagnosis_text):,} diagnosis + {len(action_plan_text):,} action plan chars"
-        )
+                update_task(
+                    task_id, "callback",
+                    f"Sending {len(diagnosis_text):,} + "
+                    f"{len(action_plan_text):,} chars to Client HQ"
+                )
+                async with httpx.AsyncClient(timeout=CALLBACK_TIMEOUT_SEC) as client:
+                    resp = await client.post(
+                        f"{CLIENT_HQ_URL}/api/process-entity-audit",
+                        headers={
+                            "Content-Type": "application/json",
+                            "Authorization": f"Bearer {AGENT_API_KEY}",
+                        },
+                        json={
+                            "audit_id": audit_id,
+                            "surge_raw_diagnosis": diagnosis_text,
+                            "surge_raw_action_plan": action_plan_text,
+                            "rehydrate": True,
+                            "rehydration_source": "history_scrape",
+                        },
+                    )
+                    if resp.status_code >= 400:
+                        return await _fail_retriable(
+                            task_id, audit_id, update_task, page,
+                            "callback_error",
+                            f"CHQ returned {resp.status_code}: "
+                            f"{resp.text[:300]}"
+                        )
+
+                update_task(
+                    task_id, "complete",
+                    f"Rehydrated {practice_name}: "
+                    f"{len(diagnosis_text):,} diagnosis + "
+                    f"{len(action_plan_text):,} action plan chars"
+                )
+
+            finally:
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
 
     except Exception as e:
-        logger.exception(f"Rehydrate task {task_id[:12]} failed")
-        await _fail_retriable(
-            task_id, audit_id, update_task, page,
-            "unexpected_error", str(e)[:300]
+        logger.exception(f"Rehydrate task {task_id[:18]} failed")
+        update_task(task_id, "error", f"Unexpected error: {str(e)[:200]}", error=str(e))
+        try:
+            await patch_audit_retriable(audit_id, "unexpected_error", str(e)[:300])
+        except Exception:
+            pass
+
+
+async def _find_run_url(
+    page,
+    practice_name: str,
+    audit_date: Optional[str],
+) -> Optional[str]:
+    """
+    Walk Surge's dashboard / history view and return the
+    /dashboard/run/<id> URL whose row text matches the practice name
+    (and audit_date when available).
+
+    Surge's history UI varies between dashboard layouts; this tries
+    /dashboard, then /dashboard/history, then a header link click as
+    a last resort. Match strategy: scan every <a> with /dashboard/run/
+    in href, pick the one whose nearest container text includes the
+    practice name. Prefer the one whose row text also contains the
+    audit_date (YYYY-MM-DD or YYYY/MM/DD) when audit_date is provided.
+    """
+    candidates = [
+        SURGE_URL.rstrip("/") + "/dashboard/history",
+        SURGE_URL.rstrip("/") + "/dashboard",
+    ]
+    for url in candidates:
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        except Exception:
+            continue
+        try:
+            await page.wait_for_load_state("networkidle", timeout=10000)
+        except Exception:
+            pass
+        await page.wait_for_timeout(2000)
+
+        run_links = await page.evaluate(
+            """({ practice, dateA, dateB }) => {
+                const anchors = Array.from(document.querySelectorAll(
+                    'a[href*="/dashboard/run/"]'
+                ));
+                const out = [];
+                for (const a of anchors) {
+                    const row = a.closest('tr')
+                        || a.closest('[role="row"]')
+                        || a.closest('[class*="row" i]')
+                        || a.parentElement
+                        || a;
+                    const text = (row.innerText || a.innerText || '').trim();
+                    out.push({
+                        href: a.href,
+                        match_practice: practice
+                            ? text.toLowerCase().includes(practice.toLowerCase())
+                            : true,
+                        match_date: (dateA && text.includes(dateA))
+                                 || (dateB && text.includes(dateB))
+                                 || false,
+                        text_preview: text.substring(0, 200),
+                    });
+                }
+                return out;
+            }""",
+            {
+                "practice": practice_name or "",
+                "dateA": audit_date or "",
+                "dateB": (audit_date or "").replace("-", "/"),
+            },
         )
-    finally:
-        if browser:
-            try:
-                await browser.close()
-            except Exception:
-                pass
+
+        if not run_links:
+            continue
+
+        # Filter to practice matches (or fall back to all if practice-name
+        # filter eliminates everything — Surge sometimes renders the brand
+        # in a separate column the row scoping doesn't reach).
+        practice_matches = [r for r in run_links if r.get("match_practice")]
+        pool = practice_matches if practice_matches else run_links
+
+        # Date-priority pick when audit_date provided
+        if audit_date:
+            for r in pool:
+                if r.get("match_date"):
+                    logger.info(
+                        f"_find_run_url date+practice match: "
+                        f"{r['href']} via {url}"
+                    )
+                    return r["href"]
+
+        if pool:
+            logger.info(
+                f"_find_run_url practice match (no date): "
+                f"{pool[0]['href']} via {url}"
+            )
+            return pool[0]["href"]
+
+    return None
 
 
-async def _capture_tab(page, tab_label: str) -> str:
-    """Click the named tab, then click its 'Copy raw text' button, then
-    read the intercepted clipboard text."""
-    # Click tab
+async def _walk_run_panes(page, run_url: str) -> tuple:
+    """
+    Navigate to a /dashboard/run/<id> URL and capture the Diagnosis (tab 0)
+    and Action plan (tab 2) panes via the Copy raw text button.
+
+    Functionally equivalent to utils.surge_run_extract._extract_one_run
+    but returns the two pane texts as a tuple instead of the combined +
+    fenced single string. Inlined here so this task does not depend on
+    private internals of surge_run_extract.
+    """
+    await page.goto(run_url, wait_until="domcontentloaded", timeout=30000)
     try:
-        await page.click(f'text={tab_label}', timeout=10000)
+        await page.wait_for_load_state("networkidle", timeout=15000)
     except Exception:
-        await page.click(f'[role="tab"]:has-text("{tab_label}")', timeout=10000)
-    await asyncio.sleep(TAB_SETTLE_SEC)
+        pass
+    await page.wait_for_timeout(5000)
 
-    # Inject clipboard interceptor (must happen each tab — switching tabs
-    # may reset window globals depending on Surge's SPA behavior).
+    # Defensive in-page intercept: covers Surge builds that write to
+    # in-page state instead of the system clipboard.
     await page.evaluate("""() => {
-        window.__surgeCopiedText = null;
+        window.__surgeChunks = [];
         const orig = navigator.clipboard.writeText.bind(navigator.clipboard);
         navigator.clipboard.writeText = (text) => {
-            window.__surgeCopiedText = text;
+            if (text) window.__surgeChunks.push(text);
             return orig(text);
-        };
-        const origExec = document.execCommand.bind(document);
-        document.execCommand = (cmd, ...args) => {
-            if (cmd === 'copy') {
-                const sel = window.getSelection();
-                if (sel) window.__surgeCopiedText = sel.toString();
-            }
-            return origExec(cmd, ...args);
         };
     }""")
 
-    btns = await page.get_elements_by_css_selector('button[title="Copy raw text"]')
-    if not btns:
-        return ""
+    try:
+        await page.wait_for_selector('#report-view-tabs', timeout=15000)
+    except Exception:
+        logger.warning("_walk_run_panes: #report-view-tabs not present")
+        return ("", "")
 
-    await btns[0].click()
-    await asyncio.sleep(2)
-    text = await page.evaluate("() => window.__surgeCopiedText")
-    return text or ""
+    async def click_tab_and_copy(idx, label):
+        clicked = await page.evaluate(
+            """(i) => {
+                const root = document.querySelector('#report-view-tabs');
+                if (!root) return false;
+                const list = Array.from(root.children);
+                const el = list[i];
+                if (!el) return false;
+                el.scrollIntoView({block: 'center'});
+                const inner = el.querySelector('button, [role=button], [role=tab]');
+                (inner || el).click();
+                return true;
+            }""",
+            idx,
+        )
+        if not clicked:
+            return ""
+        await page.wait_for_timeout(2500)
+        try:
+            await page.evaluate(
+                "() => navigator.clipboard.writeText('').catch(()=>{})"
+            )
+        except Exception:
+            pass
+        await page.evaluate("""() => {
+            const btn = document.querySelector('button[title="Copy raw text"]');
+            if (btn) btn.click();
+        }""")
+        await page.wait_for_timeout(3500)
+
+        txt = ""
+        try:
+            clip = await page.evaluate(
+                "() => navigator.clipboard.readText().catch(() => '')"
+            )
+            if isinstance(clip, str) and len(clip) > 500:
+                txt = clip
+        except Exception:
+            pass
+        if not txt:
+            chunks = await page.evaluate("() => window.__surgeChunks || []")
+            if isinstance(chunks, list) and chunks:
+                last = chunks[-1]
+                if last and len(last) > 500:
+                    txt = last
+        if txt:
+            logger.info(f"_walk_run_panes: tab {idx} ({label}) {len(txt):,} chars")
+        else:
+            logger.warning(f"_walk_run_panes: tab {idx} ({label}) empty")
+        return txt
+
+    diagnosis = await click_tab_and_copy(0, "Diagnosis")
+    action_plan = await click_tab_and_copy(2, "Action plan")
+    return (diagnosis, action_plan)
 
 
 async def _fail_retriable(task_id, audit_id, update_task, page, code, detail):
-    if page:
+    if page is not None:
         try:
+            from utils.debug_capture import capture_debug
             await capture_debug(task_id, page, code)
         except Exception:
             pass
