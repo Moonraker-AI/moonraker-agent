@@ -7,6 +7,9 @@ Architecture (hybrid approach to minimize API costs):
   Phase 1: Browser Use agent handles login + form fill + submit (~2 min, ~$0.05-0.10)
   Phase 2: Raw Playwright waits for Surge to complete (~20-35 min, $0 API cost)
   Phase 3: Raw Playwright extracts results via Copy button ($0 API cost)
+           — captures BOTH the Diagnosis tab and the Action plan tab so
+             Client HQ can extract the structural rtpba blueprint and
+             phased checklist together (2026-05-01).
   Phase 4: POST results to Client HQ + send notifications
 
 Browser Use is only used for the interactive UI phase where LLM intelligence
@@ -30,6 +33,7 @@ from utils.supabase_patch import (
     patch_audit_terminal,
     should_suppress_notification,
 )
+from utils.surge_run_extract import extract_run_via_fresh_playwright
 
 logger = logging.getLogger("agent.surge")
 
@@ -91,7 +95,8 @@ FORM_FILL_TIMEOUT_SECONDS = 120  # Max time for login + form fill phase
 # without catching legitimate small-site audits at the low end.
 
 MIN_STABLE_EXTRACTION_CHARS = 100_000   # Phase 2 settle floor
-MIN_RAW_CHARS_FOR_CALLBACK = 100_000    # Phase 3 callback guard
+MIN_RAW_CHARS_FOR_CALLBACK = 100_000    # Phase 3 callback guard (Diagnosis pane only)
+MIN_ACTION_PLAN_CHARS = 20_000          # Soft floor for Action plan pane (warn-only)
 PHASE2_SETTLE_MAX_SEC = 900             # 15 min max settle window after marker
 PHASE2_STABLE_POLLS = 2                 # consecutive 30s polls meeting the floor
 
@@ -729,7 +734,44 @@ async def execute_surge_audit(
         # Brief pause for page to fully render
         await asyncio.sleep(3)
 
-        surge_data = await _extract_surge_data(page)
+        # Preferred path: spawn a fresh Playwright session whose context can
+        # grant clipboard-read+write permissions. The keep-alive Browser-Use
+        # browser used in Phases 1-2 cannot grant `clipboard-read` via CDP in
+        # the current Chromium build, so its in-place tab-walk extraction
+        # falls back to body.textContent and only sees the currently-active
+        # tab. The fresh session walks both Diagnosis (tab 0, has Section 3
+        # RTPBA markdown ~178KB) and Action plan (tab 2, has multi-surface
+        # deployment blueprint ~290KB), reads the system clipboard for each,
+        # and concatenates ~470KB of audit data. This matters for entity
+        # audits because the Action plan tab is where the schema phases,
+        # GBP/Trust Neighborhood/Geographic Expansion playbooks, and
+        # implementation steps live — content the LLM-based
+        # process-entity-audit parser benefits from on top of Diagnosis.
+        run_url = None
+        try:
+            run_url = await page.get_url()
+        except Exception:
+            run_url = None
+        surge_data = None
+        if run_url and "/dashboard/run/" in (run_url or ""):
+            try:
+                fresh = await extract_run_via_fresh_playwright(
+                    run_url=run_url,
+                    surge_url=os.getenv("SURGE_URL", "https://www.surgeaiprotocol.com"),
+                    surge_email=os.getenv("SURGE_EMAIL", ""),
+                    surge_password=os.getenv("SURGE_PASSWORD", ""),
+                )
+                if fresh and fresh.get("raw_text"):
+                    surge_data = fresh["raw_text"]
+                    logger.info(
+                        f"Entity audit Phase 3 fresh-session capture: "
+                        f"{len(surge_data):,} chars"
+                    )
+            except Exception as fe:
+                logger.warning(f"Fresh-session capture failed, falling back: {fe}")
+
+        if not surge_data:
+            surge_data = await _extract_surge_data(page)
 
         if not surge_data or len(surge_data) < 100:
             # Extraction fundamentally failed (Copy button didn't work AND
@@ -803,10 +845,35 @@ async def execute_surge_audit(
                 logger.warning(f"Could not save raw data to Supabase: {save_err}")
                 # Non-fatal: continue with callback even if direct save fails
 
+        # ── Phase 3.6: Capture Action plan pane (dual-pane, 2026-05-01) ──
+        # surge_data above is the Diagnosis pane (default tab on the
+        # Surge results page). Switch to the Action plan tab and capture
+        # it as a separate string so Client HQ can extract the structural
+        # rtpba blueprint and phased checklist together. Skip Opportunities
+        # — content is duplicated across Diagnosis + Action plan.
+        # Soft floor: if the action plan capture is empty or short, log
+        # and continue with diagnosis-only callback. Phase 3 guard above
+        # already ensures the diagnosis pane meets MIN_RAW_CHARS_FOR_CALLBACK.
+        update_task(task_id, "extracting_action_plan", "Capturing Action plan tab")
+        action_plan_text = await _capture_action_plan_pane(page)
+        if not action_plan_text:
+            logger.warning(
+                "Action plan pane empty — proceeding with diagnosis-only callback"
+            )
+        elif len(action_plan_text) < MIN_ACTION_PLAN_CHARS:
+            logger.warning(
+                f"Action plan pane short: {len(action_plan_text):,} chars "
+                f"(soft floor {MIN_ACTION_PLAN_CHARS:,}). Proceeding anyway."
+            )
+        else:
+            logger.info(
+                f"Action plan pane captured: {len(action_plan_text):,} chars"
+            )
+
         # ── Phase 4: Post results to Client HQ ──────────────────────────
         update_task(task_id, "posting_results", "Sending results to Client HQ for processing")
 
-        await _post_results_to_client_hq(audit_id, surge_data)
+        await _post_results_to_client_hq(audit_id, surge_data, action_plan_text)
 
         # ── Phase 5: Send notifications ──────────────────────────────────
         from utils.notifications import send_success_notification
@@ -968,15 +1035,73 @@ async def _extract_surge_data(page) -> str:
     raise RuntimeError("All extraction strategies failed. Could not get Surge data.")
 
 
-async def _post_results_to_client_hq(audit_id: str, surge_data: str):
-    """POST extracted Surge data to Client HQ's process-entity-audit endpoint."""
+async def _capture_action_plan_pane(page) -> str:
+    """
+    Switch to the Action plan tab on the Surge results page and capture
+    its content via the same clipboard-intercept pattern used for the
+    Diagnosis pane. Returns "" if the tab can't be found or the copy
+    button isn't present (caller treats as warn-only — diagnosis-only
+    callback is still valid).
+    """
+    try:
+        try:
+            await page.click('text=Action plan', timeout=10000)
+        except Exception:
+            await page.click('[role="tab"]:has-text("Action plan")', timeout=10000)
+        await asyncio.sleep(3)
+
+        await page.evaluate("""() => {
+            window.__surgeCopiedText = null;
+            const orig = navigator.clipboard.writeText.bind(navigator.clipboard);
+            navigator.clipboard.writeText = (text) => {
+                window.__surgeCopiedText = text;
+                return orig(text);
+            };
+            const origExec = document.execCommand.bind(document);
+            document.execCommand = (cmd, ...args) => {
+                if (cmd === 'copy') {
+                    const sel = window.getSelection();
+                    if (sel) window.__surgeCopiedText = sel.toString();
+                }
+                return origExec(cmd, ...args);
+            };
+        }""")
+
+        btns = await page.get_elements_by_css_selector('button[title="Copy raw text"]')
+        if not btns:
+            logger.warning("Action plan tab: no Copy raw text button found")
+            return ""
+
+        await btns[0].click()
+        await asyncio.sleep(2)
+        text = await page.evaluate("() => window.__surgeCopiedText")
+        return text or ""
+
+    except Exception as e:
+        logger.warning(f"Action plan capture failed: {e}")
+        return ""
+
+
+async def _post_results_to_client_hq(
+    audit_id: str,
+    diagnosis_text: str,
+    action_plan_text: str,
+):
+    """POST extracted Surge data to Client HQ's process-entity-audit endpoint.
+
+    2026-05-01: dual-pane callback. Diagnosis is required (Phase 3 guard
+    above ensures it). Action plan is best-effort: if the helper returned
+    "" (tab missing, button missing, or transient failure) the body falls
+    back to diagnosis-only and Client HQ's legacy single-blob path runs.
+    """
+    body = {"audit_id": audit_id, "surge_raw_diagnosis": diagnosis_text}
+    if action_plan_text:
+        body["surge_raw_action_plan"] = action_plan_text
+
     async with httpx.AsyncClient(timeout=180) as client:
         response = await client.post(
             f"{CLIENT_HQ_URL}/api/process-entity-audit",
-            json={
-                "audit_id": audit_id,
-                "surge_data": surge_data,
-            },
+            json=body,
             headers={
                 "Content-Type": "application/json",
                 # Use agent API key for auth (accepted by Client HQ requireAdminOrInternal)
@@ -985,10 +1110,14 @@ async def _post_results_to_client_hq(audit_id: str, surge_data: str):
         )
 
         if response.status_code != 200:
-            body = response.text[:500]
+            body_text = response.text[:500]
             raise RuntimeError(
-                f"Client HQ returned {response.status_code}: {body}"
+                f"Client HQ returned {response.status_code}: {body_text}"
             )
 
-        logger.info(f"Successfully posted audit results for audit_id={audit_id}")
+        logger.info(
+            f"Posted dual-pane audit results for audit_id={audit_id}: "
+            f"{len(diagnosis_text):,} diagnosis + "
+            f"{len(action_plan_text):,} action plan chars"
+        )
 
