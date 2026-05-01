@@ -84,6 +84,10 @@ async def execute_surge_rehydrate(
             disable_security=True,  # clipboard access
             args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
         )
+        # Browser-Use 0.12.x: must explicitly start the browser before
+        # new_page(). Skipping start() raises
+        # "CDP client not initialized - browser may not be connected yet".
+        await browser.start()
         page = await browser.new_page()
 
         await page.goto(f"{SURGE_URL}/login")
