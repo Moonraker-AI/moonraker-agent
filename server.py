@@ -164,6 +164,13 @@ class SurgeAuditRequest(BaseModel):
     _v_website = field_validator("website_url")(classmethod(lambda cls, v: _validate_http_url(v)))
     _v_gbp = field_validator("gbp_link")(classmethod(lambda cls, v: _validate_optional_http_url(v)))
 
+class SurgeRehydrateRequest(BaseModel):
+    audit_id: str
+    practice_name: str
+    audit_date: Optional[str] = None  # 'YYYY-MM-DD' to disambiguate history rows
+    client_slug: str
+
+
 class SurgeContentAuditRequest(BaseModel):
     content_page_id: str
     website_url: str
@@ -431,6 +438,32 @@ async def create_surge_audit(request: SurgeAuditRequest):
     asyncio.create_task(_run_with_lock(task_id))
     logger.info(
         f"Queued surge audit {task_id[:8]} for {request.practice_name} "
+        f"(audit_id={request.audit_id})"
+    )
+
+    return {"task_id": task_id, "status": "queued"}
+
+
+@app.post("/tasks/surge-rehydrate", dependencies=[Depends(verify_api_key)])
+async def create_surge_rehydrate(request: SurgeRehydrateRequest):
+    task_id = f"rehydrate-{uuid.uuid4()}"
+    now = datetime.now(timezone.utc).isoformat()
+
+    tasks[task_id] = {
+        "task_id": task_id,
+        "type": "surge-rehydrate",
+        "status": "queued",
+        "message": "Rehydrate queued, waiting for browser",
+        "created_at": now,
+        "updated_at": now,
+        "error": None,
+        "duration_seconds": None,
+        "request": request.model_dump(),
+    }
+
+    asyncio.create_task(_run_rehydrate_with_lock(task_id))
+    logger.info(
+        f"Queued rehydrate {task_id[:18]} for {request.practice_name} "
         f"(audit_id={request.audit_id})"
     )
 
@@ -818,6 +851,28 @@ async def _run_with_lock(task_id: str):
                 logger.error(f"Failed to send error notification: {notify_err}")
 
         logger.info(f"Post-audit cooldown: {HEAVY_TASK_COOLDOWN}s before next task")
+        await asyncio.sleep(HEAVY_TASK_COOLDOWN)
+
+
+async def _run_rehydrate_with_lock(task_id: str):
+    """Tier 2 (Heavy Browser): Surge history rehydrate."""
+    async with browser_lock:
+        try:
+            from utils.cleanup import preflight_cleanup
+            logger.info(f"Task {task_id[:18]}: running pre-flight cleanup")
+            await asyncio.to_thread(preflight_cleanup)
+        except Exception as cleanup_err:
+            logger.warning(f"Pre-flight cleanup failed: {cleanup_err}")
+
+        update_task(task_id, "running", "Starting rehydrate browser automation")
+        try:
+            from tasks.surge_rehydrate import execute_surge_rehydrate
+            await execute_surge_rehydrate(task_id, tasks, update_task)
+        except Exception as e:
+            logger.exception(f"Rehydrate task {task_id[:18]} failed with unexpected error")
+            update_task(task_id, "error", f"Unexpected error: {str(e)[:200]}", error=str(e))
+
+        logger.info(f"Post-rehydrate cooldown: {HEAVY_TASK_COOLDOWN}s before next task")
         await asyncio.sleep(HEAVY_TASK_COOLDOWN)
 
 
