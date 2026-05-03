@@ -9,11 +9,11 @@ Lighter than surge_audit.py:
   - No new Surge run (free, doesn't burn credits)
   - No Phase 2 wait
   - Reuses utils.surge_run_extract for login + per-tab clipboard extraction
-  - Captures TWO tabs: Diagnosis and Action plan (skips Opportunities — redundant)
+  - Captures TWO tabs: Diagnosis and Action plan (skips Opportunities, redundant)
 
 Implementation note: this task uses raw Playwright (via async_playwright)
 rather than Browser-Use, because:
-  1. Browser-Use's Page wrapper exposes only goto/evaluate/screenshot —
+  1. Browser-Use's Page wrapper exposes only goto/evaluate/screenshot,
      no wait_for_selector/fill/locator. Manual login requires those.
   2. clipboard-read permission must be granted at the BrowserContext
      level, which surge_run_extract already does via
@@ -21,6 +21,18 @@ rather than Browser-Use, because:
   3. The shared _login + _extract_one_run helpers in utils/surge_run_extract
      already implement the exact tab-walk we need; reusing them avoids
      selector duplication.
+
+History-page DOM truth (2026-05-03 capture):
+  Surge's history listing no longer exposes <a href="/dashboard/run/<id>">
+  anchors. Each row has:
+    - Batch pill   <a href="/dashboard?batch=<batch-id>">  (links to batch
+      view, not run view)
+    - "View ->"    <button>View ->></button>  (no href, JS onClick handler;
+      this is the actual drill-into-run navigation)
+    - Rerun pill   <a href="/dashboard?rerun=<batch-id>">  (irrelevant)
+  Match strategy: enumerate batch anchors, walk to the row container,
+  match by practice-name (and date when provided), click the row's
+  View button via JS evaluate, then wait for #report-view-tabs.
 
 Used to enrich the 65 active clients whose original audits captured only
 the Diagnosis pane. After rehydration:
@@ -67,9 +79,9 @@ async def execute_surge_rehydrate(
     """
     Rehydration lifecycle:
       1. Launch fresh Playwright + login to Surge
-      2. Navigate to history listing
-      3. Find audit row matching practice_name + audit_date, extract run_url
-      4. Reuse _extract_one_run() for tab-walk Diagnosis + Action plan capture
+      2. SPA-click into history listing
+      3. Find row matching practice_name + audit_date, click its View button
+      4. Reuse _walk_run_panes() for tab-walk Diagnosis + Action plan capture
       5. Validate min char floors
       6. POST { audit_id, surge_raw_diagnosis, surge_raw_action_plan,
                 rehydrate: true } to /api/process-entity-audit
@@ -107,8 +119,10 @@ async def execute_surge_rehydrate(
                 await _login(page, SURGE_URL, SURGE_EMAIL, SURGE_PASSWORD)
 
                 update_task(task_id, "history", "Opening Surge history")
-                run_url = await _find_run_url(page, practice_name, audit_date)
-                if not run_url:
+                opened = await _find_and_open_run(
+                    page, practice_name, audit_date, task_id
+                )
+                if not opened:
                     return await _fail_retriable(
                         task_id, audit_id, update_task, page,
                         "history_row_not_found",
@@ -117,11 +131,27 @@ async def execute_surge_rehydrate(
                         + (f" on {audit_date}" if audit_date else "")
                     )
 
-                logger.info(f"Rehydrate match: {run_url}")
-                update_task(task_id, "extracting",
-                            f"Walking Diagnosis + Action plan tabs at {run_url}")
+                # Post-click snapshot of whatever the run-detail view rendered.
+                # Always emitted so future failure modes (selector drift,
+                # post-click URL pattern shift) are debuggable.
+                try:
+                    from utils.debug_capture import capture_debug
+                    await capture_debug(task_id, page, "post_view_click")
+                    logger.info("post_view_click snapshot captured")
+                except Exception as cap_err:
+                    logger.info(
+                        f"post_view_click capture failed: {cap_err!r}"
+                    )
 
-                diagnosis_text, action_plan_text = await _walk_run_panes(page, run_url)
+                logger.info(f"Rehydrate row opened, current URL: {page.url}")
+                update_task(
+                    task_id, "extracting",
+                    f"Walking Diagnosis + Action plan tabs at {page.url}"
+                )
+
+                diagnosis_text, action_plan_text = await _walk_run_panes(
+                    page, "", skip_goto=True
+                )
 
                 if len(diagnosis_text) < MIN_DIAGNOSIS_CHARS:
                     return await _fail_retriable(
@@ -192,116 +222,251 @@ async def execute_surge_rehydrate(
             pass
 
 
-async def _find_run_url(
+async def _find_and_open_run(
     page,
     practice_name: str,
     audit_date: Optional[str],
-) -> Optional[str]:
+    task_id: Optional[str] = None,
+) -> bool:
     """
-    Walk Surge's dashboard / history view and return the
-    /dashboard/run/<id> URL whose row text matches the practice name
-    (and audit_date when available).
+    SPA-navigate to /dashboard/history, locate the row matching
+    practice_name (+ optional audit_date), and click its View button.
 
-    Surge's history UI varies between dashboard layouts; this tries
-    /dashboard, then /dashboard/history, then a header link click as
-    a last resort. Match strategy: scan every <a> with /dashboard/run/
-    in href, pick the one whose nearest container text includes the
-    practice name. Prefer the one whose row text also contains the
-    audit_date (YYYY-MM-DD or YYYY/MM/DD) when audit_date is provided.
+    Surge's history page no longer exposes <a href="/dashboard/run/<id>">
+    anchors. Each row contains:
+      - <a href="/dashboard?batch=<batch-id>">   (the batch pill)
+      - <button>View -></button>                 (the drill-into-run trigger,
+                                                  pure JS onClick, no href)
+    We enumerate batch-pill anchors to find row containers, match each
+    row's innerText against practice (and date if given), then JS-click
+    the matched row's View button. Run-detail load is detected via
+    #report-view-tabs (timeout 20s).
+
+    Returns True if a row was matched + clicked + #report-view-tabs
+    rendered. False otherwise (caller emits history_row_not_found).
     """
-    candidates = [
-        SURGE_URL.rstrip("/") + "/dashboard/history",
-        SURGE_URL.rstrip("/") + "/dashboard",
-    ]
-    for url in candidates:
-        try:
-            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-        except Exception:
-            continue
-        try:
-            await page.wait_for_load_state("networkidle", timeout=10000)
-        except Exception:
-            pass
-        await page.wait_for_timeout(2000)
 
-        run_links = await page.evaluate(
-            """({ practice, dateA, dateB }) => {
-                const anchors = Array.from(document.querySelectorAll(
-                    'a[href*="/dashboard/run/"]'
-                ));
-                const out = [];
-                for (const a of anchors) {
-                    const row = a.closest('tr')
-                        || a.closest('[role="row"]')
-                        || a.closest('[class*="row" i]')
-                        || a.parentElement
-                        || a;
-                    const text = (row.innerText || a.innerText || '').trim();
-                    out.push({
-                        href: a.href,
-                        match_practice: practice
-                            ? text.toLowerCase().includes(practice.toLowerCase())
-                            : true,
-                        match_date: (dateA && text.includes(dateA))
-                                 || (dateB && text.includes(dateB))
-                                 || false,
-                        text_preview: text.substring(0, 200),
-                    });
-                }
-                return out;
-            }""",
-            {
-                "practice": practice_name or "",
-                "dateA": audit_date or "",
-                "dateB": (audit_date or "").replace("-", "/"),
-            },
+    # Phase 1: get to /dashboard/history via the SPA nav anchor.
+    # Caller (_login) just landed on /dashboard, so the rail is hydrated.
+    try:
+        await page.wait_for_selector(
+            'a[href="/dashboard/history"]', timeout=8000
         )
+    except Exception:
+        logger.info("History nav anchor not visible within 8s")
+        return False
 
-        if not run_links:
-            continue
+    clicked = await page.evaluate(
+        """() => {
+            const a = document.querySelector('a[href="/dashboard/history"]');
+            if (!a) return false;
+            a.click();
+            return true;
+        }"""
+    )
+    if not clicked:
+        logger.info("History nav anchor evaluate-click returned false")
+        return False
+    logger.info("History nav clicked")
 
-        # Filter to practice matches (or fall back to all if practice-name
-        # filter eliminates everything — Surge sometimes renders the brand
-        # in a separate column the row scoping doesn't reach).
-        practice_matches = [r for r in run_links if r.get("match_practice")]
-        pool = practice_matches if practice_matches else run_links
+    try:
+        await page.wait_for_url("**/dashboard/history", timeout=15000)
+    except Exception as e:
+        logger.info(f"wait_for_url(/dashboard/history) failed: {e!r}")
+        return False
 
-        # Date-priority pick when audit_date provided
-        if audit_date:
-            for r in pool:
-                if r.get("match_date"):
-                    logger.info(
-                        f"_find_run_url date+practice match: "
-                        f"{r['href']} via {url}"
-                    )
-                    return r["href"]
+    try:
+        await page.wait_for_load_state("networkidle", timeout=10000)
+    except Exception:
+        pass
 
-        if pool:
+    # Unconditional snapshot of /dashboard/history BEFORE we attempt
+    # to find rows. Lets us inspect Surge's real markup even when our
+    # selector guess is wrong. Wrapped so capture errors never block
+    # the main flow.
+    if task_id:
+        try:
+            from utils.debug_capture import capture_debug
+            await capture_debug(task_id, page, "history_page_snapshot")
+            logger.info("history_page_snapshot captured")
+        except Exception as cap_err:
             logger.info(
-                f"_find_run_url practice match (no date): "
-                f"{pool[0]['href']} via {url}"
+                f"history_page_snapshot capture failed: {cap_err!r}"
             )
-            return pool[0]["href"]
 
-    return None
+    # Phase 2: wait for the listing to populate.
+    try:
+        await page.wait_for_selector(
+            'a[href*="/dashboard?batch="]', timeout=15000
+        )
+    except Exception:
+        logger.info("No batch-pill anchors rendered within 15s")
+        return False
+
+    anchor_count = await page.evaluate(
+        """() => document.querySelectorAll(
+            'a[href*="/dashboard?batch="]'
+        ).length"""
+    )
+    logger.info(
+        f"History listing rendered with {anchor_count} batch-pill anchors"
+    )
+
+    # Phase 3: find the matching row in JS-evaluate land, then click
+    # the row's View button. Both happen in one round-trip so we don't
+    # have to round-trip element handles back to Python.
+    result = await page.evaluate(
+        """({ practice, dateA, dateB }) => {
+            const VIEW_RE = /^view\\s*[\\u2192>]?\\s*$/i;
+            const anchors = Array.from(document.querySelectorAll(
+                'a[href*="/dashboard?batch="]'
+            ));
+            const candidates = [];
+            for (const a of anchors) {
+                // The history rows are <div>-based with no obvious class.
+                // Try the standard semantic ancestors first; fall back to
+                // walking up a fixed number of parents to reach a
+                // container that holds both the batch pill and the View
+                // button. Empirically the View button sits 3-4 levels up.
+                let row = a.closest('tr')
+                       || a.closest('[role="row"]')
+                       || a.closest('[class*="row" i]');
+                if (!row) {
+                    let cur = a;
+                    for (let i = 0; i < 6 && cur; i++) {
+                        cur = cur.parentElement;
+                        if (!cur) break;
+                        const btns = Array.from(cur.querySelectorAll('button'));
+                        if (btns.some(b => VIEW_RE.test(
+                            (b.innerText || '').trim()
+                        ))) {
+                            row = cur;
+                            break;
+                        }
+                    }
+                }
+                if (!row) continue;
+                const text = (row.innerText || '').trim();
+                const matchPractice = practice
+                    ? text.toLowerCase().includes(practice.toLowerCase())
+                    : true;
+                const matchDate = (dateA && text.includes(dateA))
+                              || (dateB && text.includes(dateB))
+                              || false;
+                candidates.push({
+                    row, text,
+                    matchPractice, matchDate,
+                    href: a.href,
+                });
+            }
+
+            // Filter to practice-matching rows; if none, fall back to all.
+            const practiceMatches = candidates.filter(c => c.matchPractice);
+            const pool = practiceMatches.length ? practiceMatches : candidates;
+
+            // Date-priority pick when audit_date was provided.
+            let pick = null;
+            if ((dateA || dateB) && pool.length) {
+                pick = pool.find(c => c.matchDate) || null;
+            }
+            if (!pick && pool.length) {
+                pick = pool[0];
+            }
+            if (!pick) {
+                return {
+                    matched: false,
+                    reason: 'no_candidate',
+                    anchorCount: anchors.length,
+                };
+            }
+
+            // Find the View button inside the matched row.
+            const btns = Array.from(pick.row.querySelectorAll('button'));
+            const viewBtn = btns.find(b => VIEW_RE.test(
+                (b.innerText || '').trim()
+            ));
+            if (!viewBtn) {
+                return {
+                    matched: false,
+                    reason: 'no_view_button',
+                    href: pick.href,
+                    text_preview: pick.text.substring(0, 240),
+                };
+            }
+
+            viewBtn.scrollIntoView({block: 'center'});
+            viewBtn.click();
+            return {
+                matched: true,
+                href: pick.href,
+                text_preview: pick.text.substring(0, 240),
+                matchDate: pick.matchDate,
+                matchPractice: pick.matchPractice,
+            };
+        }""",
+        {
+            "practice": practice_name or "",
+            "dateA": audit_date or "",
+            "dateB": (audit_date or "").replace("-", "/"),
+        },
+    )
+
+    if not result or not result.get("matched"):
+        reason = (result or {}).get("reason", "unknown")
+        logger.info(
+            f"_find_and_open_run no match: reason={reason} "
+            f"detail={result!r}"
+        )
+        return False
+
+    logger.info(
+        f"_find_and_open_run clicked View on row "
+        f"batch={result.get('href')} "
+        f"date_match={result.get('matchDate')} "
+        f"practice_match={result.get('matchPractice')} "
+        f"preview={result.get('text_preview', '')[:120]!r}"
+    )
+
+    # Phase 4: wait for the run-detail view marker. Don't wait_for_url,
+    # we don't know what URL pattern Surge uses (could be
+    # /dashboard?batch=...&run=..., a hash route, or modal-overlay state).
+    try:
+        await page.wait_for_selector('#report-view-tabs', timeout=20000)
+    except Exception as e:
+        logger.info(
+            f"#report-view-tabs not present after View click: {e!r}"
+        )
+        return False
+
+    return True
 
 
-async def _walk_run_panes(page, run_url: str) -> tuple:
+async def _walk_run_panes(
+    page,
+    run_url: str,
+    skip_goto: bool = False,
+) -> tuple:
     """
-    Navigate to a /dashboard/run/<id> URL and capture the Diagnosis (tab 0)
-    and Action plan (tab 2) panes via the Copy raw text button.
+    Capture the Diagnosis (tab 0) and Action plan (tab 2) panes via the
+    Copy raw text button.
+
+    When skip_goto=False (default), navigates to run_url via page.goto.
+    When skip_goto=True (rehydrate flow), assumes the page is already on
+    the run-detail view and that #report-view-tabs is already mounted
+    (caller's responsibility, e.g. _find_and_open_run).
 
     Functionally equivalent to utils.surge_run_extract._extract_one_run
     but returns the two pane texts as a tuple instead of the combined +
     fenced single string. Inlined here so this task does not depend on
     private internals of surge_run_extract.
     """
-    await page.goto(run_url, wait_until="domcontentloaded", timeout=30000)
-    try:
-        await page.wait_for_load_state("networkidle", timeout=15000)
-    except Exception:
-        pass
-    await page.wait_for_timeout(5000)
+    if not skip_goto:
+        await page.goto(run_url, wait_until="domcontentloaded", timeout=30000)
+        try:
+            await page.wait_for_load_state("networkidle", timeout=15000)
+        except Exception:
+            pass
+        await page.wait_for_timeout(5000)
 
     # Defensive in-page intercept: covers Surge builds that write to
     # in-page state instead of the system clipboard.
@@ -314,11 +479,12 @@ async def _walk_run_panes(page, run_url: str) -> tuple:
         };
     }""")
 
-    try:
-        await page.wait_for_selector('#report-view-tabs', timeout=15000)
-    except Exception:
-        logger.warning("_walk_run_panes: #report-view-tabs not present")
-        return ("", "")
+    if not skip_goto:
+        try:
+            await page.wait_for_selector('#report-view-tabs', timeout=15000)
+        except Exception:
+            logger.warning("_walk_run_panes: #report-view-tabs not present")
+            return ("", "")
 
     async def click_tab_and_copy(idx, label):
         clicked = await page.evaluate(
