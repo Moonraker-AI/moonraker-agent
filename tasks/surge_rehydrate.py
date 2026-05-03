@@ -46,7 +46,8 @@ import asyncio
 import logging
 import os
 import re
-from typing import Callable, Optional
+from datetime import date, datetime, timedelta
+from typing import Callable, List, Optional
 
 import httpx
 from playwright.async_api import async_playwright
@@ -69,6 +70,42 @@ MIN_DIAGNOSIS_CHARS = 50_000
 MIN_ACTION_PLAN_CHARS = 20_000
 
 CALLBACK_TIMEOUT_SEC = 600
+
+_MONTHS_ABBR = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+]
+
+
+def _date_acceptance_strings(audit_date: Optional[str]) -> List[str]:
+    """
+    Soften date matching against Surge UI drift.
+
+    Surge displays "Apr 12" while CHQ stores audit_date=2026-04-10 — a
+    ~2-day delta is normal (created_at vs run_finished_at + UTC offset).
+    Generate a small acceptance set spanning [-2, +2] days, including
+    YYYY-MM-DD, YYYY/MM/DD, MMM D, and MMM D, YYYY.
+
+    Returns [] when audit_date is missing or unparseable.
+    """
+    if not audit_date:
+        return []
+    try:
+        base = datetime.strptime(audit_date[:10], "%Y-%m-%d").date()
+    except Exception:
+        return []
+    out: List[str] = []
+    for delta in range(-2, 3):
+        d = base + timedelta(days=delta)
+        iso = d.strftime("%Y-%m-%d")
+        slash = d.strftime("%Y/%m/%d")
+        mon = _MONTHS_ABBR[d.month - 1]
+        short = f"{mon} {d.day}"
+        long_ = f"{mon} {d.day}, {d.year}"
+        for s in (iso, slash, short, long_):
+            if s not in out:
+                out.append(s)
+    return out
 
 
 async def execute_surge_rehydrate(
@@ -294,120 +331,169 @@ async def _find_and_open_run(
                 f"history_page_snapshot capture failed: {cap_err!r}"
             )
 
-    # Phase 2: wait for the listing to populate.
+    # Phase 2: wait for any row to render. Soften date matching ±2 days
+    # to absorb created_at vs run_finished_at + UTC drift; soften the row
+    # discovery to walk up from View buttons (the only reliable click
+    # target; rows are pure <div>s with no batch-pill anchor in filtered
+    # views). The batch-pill selector was dropping to 0 hits post-filter
+    # while the View buttons remained — see Apr-23 audit notes.
     try:
-        await page.wait_for_selector(
-            'a[href*="/dashboard?batch="]', timeout=15000
+        await page.wait_for_function(
+            """() => {
+                const VIEW_RE = /^view\\s*[\\u2192>]?\\s*$/i;
+                return Array.from(document.querySelectorAll('button'))
+                    .some(b => VIEW_RE.test((b.innerText || '').trim()));
+            }""",
+            timeout=15000,
         )
     except Exception:
-        logger.info("No batch-pill anchors rendered within 15s")
+        logger.info("No View buttons rendered within 15s")
         return False
 
-    anchor_count = await page.evaluate(
-        """() => document.querySelectorAll(
-            'a[href*="/dashboard?batch="]'
-        ).length"""
+    button_count = await page.evaluate(
+        """() => {
+            const VIEW_RE = /^view\\s*[\\u2192>]?\\s*$/i;
+            return Array.from(document.querySelectorAll('button'))
+                .filter(b => VIEW_RE.test((b.innerText || '').trim())).length;
+        }"""
     )
     logger.info(
-        f"History listing rendered with {anchor_count} batch-pill anchors"
+        f"History listing rendered with {button_count} View buttons "
+        f"(default top-5 view)"
     )
 
-    # Phase 3: find the matching row in JS-evaluate land, then click
-    # the row's View button. Both happen in one round-trip so we don't
-    # have to round-trip element handles back to Python.
-    result = await page.evaluate(
-        """({ practice, dateA, dateB }) => {
-            const VIEW_RE = /^view\\s*[\\u2192>]?\\s*$/i;
-            const anchors = Array.from(document.querySelectorAll(
-                'a[href*="/dashboard?batch="]'
-            ));
-            const candidates = [];
-            for (const a of anchors) {
-                // The history rows are <div>-based with no obvious class.
-                // Try the standard semantic ancestors first; fall back to
-                // walking up a fixed number of parents to reach a
-                // container that holds both the batch pill and the View
-                // button. Empirically the View button sits 3-4 levels up.
-                let row = a.closest('tr')
-                       || a.closest('[role="row"]')
-                       || a.closest('[class*="row" i]');
-                if (!row) {
-                    let cur = a;
-                    for (let i = 0; i < 6 && cur; i++) {
-                        cur = cur.parentElement;
-                        if (!cur) break;
-                        const btns = Array.from(cur.querySelectorAll('button'));
-                        if (btns.some(b => VIEW_RE.test(
+    # Phase 2.5: filter to the practice. Search input drives a debounced
+    # client-side filter; Surge re-renders rows using <div> containers
+    # only (no batch-pill anchor), so we re-count via View buttons.
+    if practice_name:
+        try:
+            search_sel = 'input[placeholder*="Search by query, brand"]'
+            await page.wait_for_selector(search_sel, timeout=4000)
+            await page.fill(search_sel, practice_name)
+            await page.wait_for_timeout(1200)  # Surge debounce
+            new_count = await page.evaluate(
+                """() => {
+                    const VIEW_RE = /^view\\s*[\\u2192>]?\\s*$/i;
+                    return Array.from(document.querySelectorAll('button'))
+                        .filter(b => VIEW_RE.test(
                             (b.innerText || '').trim()
-                        ))) {
-                            row = cur;
-                            break;
-                        }
+                        )).length;
+                }"""
+            )
+            logger.info(
+                f"Search filter applied: {practice_name!r} -> "
+                f"{new_count} View buttons visible"
+            )
+        except Exception as e:
+            logger.info(
+                f"Search input not present, continuing without filter: {e!r}"
+            )
+
+    # Phase 3: discover rows by walking UP from each View button. Match
+    # against a softened date acceptance set; single-practice-match
+    # auto-clicks even without a date hit. Multiple practice matches
+    # require date disambiguation.
+    date_strings = _date_acceptance_strings(audit_date)
+    logger.info(
+        f"Date acceptance set ({len(date_strings)} strings): "
+        f"{date_strings!r}"
+    )
+
+    result = await page.evaluate(
+        """({ practice, dateStrings }) => {
+            const VIEW_RE = /^view\\s*[\\u2192>]?\\s*$/i;
+            // Row signature: a container that holds the practice name AND
+            // a View button AND some when-text (date abbrev or "ago" /
+            // "Yesterday"). Walk UP from each View button up to N parents
+            // until we hit a container that satisfies the signature.
+            const viewBtns = Array.from(
+                document.querySelectorAll('button')
+            ).filter(b => VIEW_RE.test((b.innerText || '').trim()));
+            const candidates = [];
+            const seenRows = new Set();
+            const practiceLc = (practice || '').toLowerCase();
+            const WHEN_RE = /\\b(ago|Yesterday|Today|Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec|\\d{4}-\\d{2}-\\d{2}|\\d{4}\\/\\d{2}\\/\\d{2})\\b/;
+            for (const btn of viewBtns) {
+                let row = null;
+                let cur = btn;
+                for (let i = 0; i < 8 && cur; i++) {
+                    cur = cur.parentElement;
+                    if (!cur) break;
+                    const text = (cur.innerText || '').trim();
+                    const hasPractice = practiceLc
+                        ? text.toLowerCase().includes(practiceLc)
+                        : true;
+                    const hasWhen = WHEN_RE.test(text);
+                    const hasView = Array.from(
+                        cur.querySelectorAll('button')
+                    ).some(b => VIEW_RE.test(
+                        (b.innerText || '').trim()
+                    ));
+                    if (hasPractice && hasWhen && hasView) {
+                        row = cur;
+                        break;
                     }
                 }
                 if (!row) continue;
+                if (seenRows.has(row)) continue;
+                seenRows.add(row);
                 const text = (row.innerText || '').trim();
-                const matchPractice = practice
-                    ? text.toLowerCase().includes(practice.toLowerCase())
+                const matchPractice = practiceLc
+                    ? text.toLowerCase().includes(practiceLc)
                     : true;
-                const matchDate = (dateA && text.includes(dateA))
-                              || (dateB && text.includes(dateB))
-                              || false;
+                const matchDate = (dateStrings || []).some(
+                    s => s && text.includes(s)
+                );
                 candidates.push({
-                    row, text,
-                    matchPractice, matchDate,
-                    href: a.href,
+                    row, btn, text, matchPractice, matchDate,
                 });
             }
 
-            // Filter to practice-matching rows; if none, fall back to all.
             const practiceMatches = candidates.filter(c => c.matchPractice);
-            const pool = practiceMatches.length ? practiceMatches : candidates;
 
-            // Date-priority pick when audit_date was provided.
+            // Pick: single practice match auto-clicks (date drift is OK).
+            // Multiple practice matches require a date hit; if none match
+            // any date in the soft acceptance set, fail loud rather than
+            // guessing.
             let pick = null;
-            if ((dateA || dateB) && pool.length) {
-                pick = pool.find(c => c.matchDate) || null;
+            if (practiceMatches.length === 1) {
+                pick = practiceMatches[0];
+            } else if (practiceMatches.length > 1) {
+                if ((dateStrings || []).length) {
+                    pick = practiceMatches.find(c => c.matchDate) || null;
+                }
+                if (!pick) {
+                    return {
+                        matched: false,
+                        reason: 'multiple_practice_matches_no_date',
+                        anchorCount: viewBtns.length,
+                        candidateCount: practiceMatches.length,
+                    };
+                }
             }
-            if (!pick && pool.length) {
-                pick = pool[0];
-            }
+
             if (!pick) {
                 return {
                     matched: false,
-                    reason: 'no_candidate',
-                    anchorCount: anchors.length,
+                    reason: 'practice_not_in_history',
+                    anchorCount: viewBtns.length,
+                    candidateCount: candidates.length,
                 };
             }
 
-            // Find the View button inside the matched row.
-            const btns = Array.from(pick.row.querySelectorAll('button'));
-            const viewBtn = btns.find(b => VIEW_RE.test(
-                (b.innerText || '').trim()
-            ));
-            if (!viewBtn) {
-                return {
-                    matched: false,
-                    reason: 'no_view_button',
-                    href: pick.href,
-                    text_preview: pick.text.substring(0, 240),
-                };
-            }
-
-            viewBtn.scrollIntoView({block: 'center'});
-            viewBtn.click();
+            pick.btn.scrollIntoView({block: 'center'});
+            pick.btn.click();
             return {
                 matched: true,
-                href: pick.href,
                 text_preview: pick.text.substring(0, 240),
                 matchDate: pick.matchDate,
                 matchPractice: pick.matchPractice,
+                practiceMatchCount: practiceMatches.length,
             };
         }""",
         {
             "practice": practice_name or "",
-            "dateA": audit_date or "",
-            "dateB": (audit_date or "").replace("-", "/"),
+            "dateStrings": date_strings,
         },
     )
 
@@ -421,9 +507,9 @@ async def _find_and_open_run(
 
     logger.info(
         f"_find_and_open_run clicked View on row "
-        f"batch={result.get('href')} "
         f"date_match={result.get('matchDate')} "
         f"practice_match={result.get('matchPractice')} "
+        f"practice_matches={result.get('practiceMatchCount')} "
         f"preview={result.get('text_preview', '')[:120]!r}"
     )
 
