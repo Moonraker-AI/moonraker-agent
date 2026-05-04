@@ -65,9 +65,9 @@ COMPONENT USAGE RULES:
   links (`#services`, `#about`) preserved as-is.
 
 - `<ImageBlock src="..." alt="..." width={N} height={N} caption?>` for
-  every content image. `src` MUST come from the asset map (origin URL ->
-  Cloudflare delivery URL). NEVER use Astro's built-in `<Image>`. NEVER
-  use a raw `<img>` with a URL not in the asset map.
+  every content image. `src` MUST come from the asset map. NEVER use
+  Astro's built-in `<Image>`. NEVER use a raw `<img>` with a URL not in
+  the asset map.
 
 - `<BulletList items={[...]} marker?="arrow|dot|check|number">` for any
   list of features, services, or short bullets. `arrow` is the default
@@ -81,8 +81,21 @@ COMPONENT USAGE RULES:
 ASSET MAP DISCIPLINE:
 
 - The user message contains an `asset map` JSON. Each entry maps the
-  origin asset URL to `{ cf_url, r2_key, alt_text, width, height }`.
-- Every image in your output must use the `cf_url` as the `src` value.
+  origin asset URL to `{ url, cf_url, r2_key, alt_text, width, height }`.
+- `url` is the canonical public URL for the asset. It is ALWAYS one of:
+    a. `https://imagedelivery.net/<hash>/<id>/<variant>` when Cloudflare
+       Images is enabled for this migration, OR
+    b. `https://<worker>.workers.dev/serve/migration/<id>/assets/<sha>.<ext>`
+       (the R2 Worker public route — the default since 2026-05).
+  Both shapes are valid and serve the same image. The agent has already
+  decided which one to use; you must NOT choose between them — just pass
+  through the value of `url` from the asset map entry.
+- `cf_url` is populated only when `url` is the imagedelivery.net form;
+  it mirrors `url` in that case and is null otherwise. Treat it as a
+  legacy field; prefer `url`.
+- Every image in your output must use the asset map's `url` as the
+  `src` value (or `cf_url` when present — they are identical when both
+  exist).
 - Do NOT reference any image URL that is not present in the asset map.
   If the origin had an image that was not captured (asset map miss),
   omit it.

@@ -709,6 +709,13 @@ async def _ingest_asset_originals(
                     width, height = im.size
                 except Exception:
                     pass
+                # CF Images is optional. When CF_IMAGES_HASH is unset the
+                # integration is disabled and `is_configured()` returns
+                # False, so we skip the upload and store NULL for
+                # cf_image_id. The rewriter will resolve the asset URL
+                # via the R2 Worker's /serve route instead. A None
+                # return from upload_bytes is also treated as
+                # success-without-cf-id (graceful disable).
                 if cf_images.is_configured():
                     try:
                         cf_image_id = await cf_images.upload_bytes(
@@ -719,6 +726,7 @@ async def _ingest_asset_originals(
                         )
                     except Exception as ce:
                         logger.warning(f"CF Images upload failed for {url}: {ce}")
+                        cf_image_id = None
 
             await upsert_asset({
                 "migration_id": migration_id,
