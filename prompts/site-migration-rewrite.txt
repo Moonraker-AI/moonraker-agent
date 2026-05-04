@@ -28,12 +28,15 @@ to retry once and then mark the page as failed):
      a. `import Site from '../layouts/Site.astro';`
      b. Imports for every shared component you reference in the body. Use
         these import paths exactly:
-          import Hero       from '../components/Hero.astro';
-          import Section    from '../components/Section.astro';
-          import TwoColumn  from '../components/TwoColumn.astro';
-          import Button     from '../components/Button.astro';
-          import ImageBlock from '../components/ImageBlock.astro';
-          import BulletList from '../components/BulletList.astro';
+          import Hero        from '../components/Hero.astro';
+          import Section     from '../components/Section.astro';
+          import TwoColumn   from '../components/TwoColumn.astro';
+          import Button      from '../components/Button.astro';
+          import ImageBlock  from '../components/ImageBlock.astro';
+          import BulletList  from '../components/BulletList.astro';
+          import Accordion   from '../components/Accordion.astro';
+          import Carousel    from '../components/Carousel.astro';
+          import Testimonial from '../components/Testimonial.astro';
         Only import what you actually use.
      c. `const meta = { ... }` populated from the captured head meta:
           title, description, canonical, ogImage, ogType ('website' for
@@ -130,6 +133,24 @@ COMPONENT USAGE RULES:
 
 - `<BulletList items={[...]} marker?="arrow|dot|check|number">`. Use the
   marker style that matches the origin (most therapy sites use `arrow`).
+
+- `<Accordion items={[{q, a, open?}, ...]}>` for FAQ blocks and
+  collapsible Q&A patterns. `q` and `a` are HTML strings — preserve any
+  inline emphasis and links from the origin verbatim. Set `open: true`
+  on the first item ONLY if the origin opens an item by default.
+
+- `<Carousel slidesPerView={N} slidesPerViewMobile={1}>` wraps a
+  scroll-snap row of slotted children. Use it for testimonial sliders,
+  partner-logo strips, and photo strips. Pass `slidesPerView` matching
+  what the origin shows on desktop (commonly 1 for full-width quote
+  sliders, 3 for partner logo rows). Each child must be a single block
+  (Testimonial, ImageBlock, or a div).
+
+- `<Testimonial quote="..." name? title? avatarSrc? avatarAlt? rating?>`
+  for individual quote cards. Use inside `<Carousel>` for sliders, or
+  stack inside `<Section>` for static grids. Quote string is HTML —
+  preserve emphasis tags. Skip `rating` unless the origin shows star
+  rating glyphs.
 
 - `<Nav>` and `<Footer>` are rendered by the shared layout. Override only
   by passing `navLinks`, `navCta`, `footerLinks`, `footerSocial`,

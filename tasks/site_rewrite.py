@@ -222,6 +222,28 @@ async def run_site_rewrite(task_id, params, status_callback, env=None):
             except Exception as e:
                 logger.warning(f"tokens.override.css R2 push failed: {e}")
 
+        # 4b. Vendor origin's CSS bundles into public/origin.css for visual
+        #     replica fidelity. Astro copies public/ verbatim into dist/.
+        origin_css_path = work_tree / "public" / "origin.css"
+        origin_marker = work_tree / ".origin-css-applied"
+        if force_tokens or not origin_marker.exists():
+            await status_callback(task_id, "running", "vendoring origin CSS bundles")
+            try:
+                origin_css = await _vendor_origin_css(manifest)
+                origin_css_path.parent.mkdir(parents=True, exist_ok=True)
+                origin_css_path.write_text(origin_css, encoding="utf-8")
+                origin_marker.write_text(datetime.now(timezone.utc).isoformat(), encoding="utf-8")
+                try:
+                    await r2_client.put_object(
+                        f"migration/{migration_id}/origin.css",
+                        origin_css.encode("utf-8"),
+                        content_type="text/css; charset=utf-8",
+                    )
+                except Exception as e:
+                    logger.warning(f"origin.css R2 push failed: {e}")
+            except Exception as e:
+                logger.warning(f"origin.css vendoring failed (non-fatal): {e}")
+
         # 5. Call Claude (with one retry on validation failure)
         astro_text, validation_error = await _generate_and_validate(
             status_callback=status_callback,
@@ -496,6 +518,71 @@ def _compress_for_anthropic(png_bytes: bytes) -> tuple[bytes, str]:
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=85, optimize=True)
     return buf.getvalue(), "image/jpeg"
+
+
+async def _vendor_origin_css(manifest: dict) -> str:
+    """Fetch every CSS bundle referenced by the captured manifest from its
+    origin CDN, concatenate, and return as a single CSS string ready to ship
+    in dist/origin.css.
+
+    Loaded AFTER the template's tokens.css and component-scoped CSS, so its
+    element-level rules (body, h1, a) win for visual replica fidelity. Class
+    selectors only fire when the rewriter emits matching markup — they do
+    no harm otherwise.
+
+    Best-effort: failures on individual fetches are logged and skipped.
+    """
+    import httpx
+    assets = manifest.get("assets") or []
+    css_urls: list[str] = []
+    seen: set[str] = set()
+    for u in assets:
+        if not isinstance(u, str):
+            continue
+        # Identify CSS by extension or googlefonts CSS API or content-disposition.
+        if u in seen:
+            continue
+        seen.add(u)
+        path = u.split("?", 1)[0].lower()
+        if path.endswith(".css") or "fonts.googleapis.com/css" in u:
+            css_urls.append(u)
+
+    if not css_urls:
+        return "/* no origin CSS bundles found in manifest */\n"
+
+    sections: list[str] = [
+        "/* ────────────────────────────────────────────────────────────",
+        " * origin.css — vendored stylesheets from the captured site.",
+        " * Loaded AFTER template tokens; element selectors win for visual",
+        " * replica. Read-only artifact: regenerated on every rewrite.",
+        " * ────────────────────────────────────────────────────────── */",
+        "",
+    ]
+
+    fetched_count = 0
+    async with httpx.AsyncClient(
+        timeout=20.0,
+        follow_redirects=True,
+        headers={"User-Agent": "MoonrakerSiteMigrator/1.0 (+https://moonraker.ai/migrator)"},
+    ) as client:
+        for url in css_urls:
+            try:
+                resp = await client.get(url)
+                if resp.status_code >= 400:
+                    logger.warning(f"origin CSS fetch {url} -> {resp.status_code}")
+                    continue
+                body = resp.text
+                if not body.strip():
+                    continue
+                sections.append(f"/* ── {url} ── */")
+                sections.append(body)
+                sections.append("")
+                fetched_count += 1
+            except Exception as e:
+                logger.warning(f"origin CSS fetch {url} failed: {e}")
+
+    logger.info(f"vendored {fetched_count}/{len(css_urls)} origin CSS bundles")
+    return "\n".join(sections)
 
 
 def _image_block(png_bytes: bytes, label: str) -> dict:
