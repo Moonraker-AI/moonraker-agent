@@ -1,48 +1,56 @@
 """
 tasks/site_rewrite.py
 =====================
-Site-migration job 2 of 2: take a captured page (rendered HTML + section
-screenshots + asset map) and produce a clean semantic HTML rewrite that
-visually matches the origin.
+Site-migration job 2 of 2 (v4 — Astro output).
 
-Spec: docs/site-migration-agent-job-spec.md §2 (lives in client-hq repo).
+Spec: docs/site-migration-agent-job-spec.md §2 (Astro output)
+      docs/site-migration-spec.md §8 + §11A (Astro template architecture)
 
 Pipeline:
-  1. Read captured artifacts from R2 + page row from Supabase.
-  2. Read site_migration_assets to build origin -> CF Images URL map.
-  3. Call Claude (claude-opus-4-7) with the system prompt at
-     prompts/site-migration-rewrite.txt and the captured artifacts as input.
-  4. Validate output: single self-contained HTML, JSON-LD blocks copied,
-     no asset URLs outside the asset map.
-  5. Push rewritten HTML to R2 at migration/<id>/rewritten/<sha>.html.
-  6. Render the rewritten HTML in fresh Playwright, screenshot at the same
-     viewport, run a per-section pixel diff vs origin section screenshots.
-  7. PATCH page row with rewritten_html_r2_key, rewrite_status='rewritten',
-     visual_diff_score (0..1, lower is better).
+  1. Ensure per-migration working tree at /tmp/build/<migration_id>/.
+     Clone moonraker-site-template (depth=1) on first call.
+  2. Read captured artifacts from R2 (rendered.html, styles.json,
+     manifest.json, screenshot-desktop.png, sections/*.png) and the page
+     row from Supabase. Read site_migration_assets for the asset map.
+  3. On first rewrite for the migration (or force_tokens=true), generate
+     src/styles/tokens.override.css from styles.json (spec §2.5) and push
+     a copy to R2 at client-sites/migration/<id>/tokens.override.css.
+  4. Call Claude with the system prompt at prompts/site-migration-rewrite.txt
+     and the captured screenshots as multimodal content.
+  5. Validate output: must be a valid Astro page (frontmatter, Site import,
+     <Site> wrapper, asset-map-only image refs). Retry once with feedback.
+  6. Map page.path -> src/pages/<route>.astro on disk. Write the file.
+     Push a copy to R2 at client-sites/migration/<id>/src/<route>.astro.
+  7. If build_after=true (default): run §2.6 build + §2.7 deploy. Patch
+     site_migrations.last_built_at + last_deployed_at.
+  8. Patch the page row with rewritten_html_r2_key (the .astro key),
+     rewrite_status='rewritten' or 'published', visual_diff_score.
 
-Re-prompt loop (spec §2.4): operator can re-dispatch with a `feedback` field;
-the agent appends it to the system prompt context and regenerates.
+Re-prompt loop (spec §2.4): operator can re-dispatch with a `feedback`
+field; the agent appends it to the system prompt context and regenerates
+just that page, then rebuilds.
 """
 
 from __future__ import annotations
 
 import asyncio
 import base64
-import hashlib
 import io
 import json
 import logging
 import os
+import re
+import shutil
+import subprocess
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
-from urllib.parse import urlparse
 
 import httpx
-from playwright.async_api import async_playwright
 
 from utils import r2_client
+from utils.astro_tokens import derive_overrides, render_override_css
 from utils.site_migration_db import (
     get_assets_for_migration,
     get_page,
@@ -59,17 +67,45 @@ ANTHROPIC_API_BASE = "https://api.anthropic.com"
 PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
 SYSTEM_PROMPT_PATH = PROMPTS_DIR / "site-migration-rewrite.txt"
 
-VISUAL_DIFF_VIEWPORT = {"width": 1440, "height": 900}
+TEMPLATE_REPO_URL = os.getenv(
+    "SITE_TEMPLATE_REPO_URL",
+    "https://github.com/Moonraker-AI/moonraker-site-template.git",
+)
+WORK_TREE_BASE = Path(os.getenv("SITE_BUILD_BASE", "/tmp/build"))
+
+NPM_INSTALL_TIMEOUT_S = 120
+ASTRO_BUILD_TIMEOUT_S = 90
+
+# R2 cache-control by file extension (spec §2.7)
+CACHE_CONTROL_HTML = "public, max-age=300, s-maxage=86400, stale-while-revalidate=604800"
+CACHE_CONTROL_IMMUTABLE = "public, max-age=31536000, immutable"
+
+CONTENT_TYPES = {
+    ".html": "text/html; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".js": "application/javascript; charset=utf-8",
+    ".mjs": "application/javascript; charset=utf-8",
+    ".json": "application/json",
+    ".xml": "application/xml",
+    ".txt": "text/plain; charset=utf-8",
+    ".svg": "image/svg+xml",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".avif": "image/avif",
+    ".ico": "image/x-icon",
+    ".woff": "font/woff",
+    ".woff2": "font/woff2",
+    ".ttf": "font/ttf",
+    ".otf": "font/otf",
+    ".webmanifest": "application/manifest+json",
+    ".pdf": "application/pdf",
+}
 
 
 def _cf_image_delivery_url(cf_image_id: str, *, variant: str = "public") -> str:
-    """Cloudflare Images delivery URL.
-
-    Caller must set CF_IMAGES_HASH (the per-account image hash from the
-    Cloudflare dashboard). If absent we return the relative cf:<id>:<variant>
-    placeholder so the rewriter still has *something* to substitute and a
-    later deploy step can rewrite to absolute URLs.
-    """
     h = os.getenv("CF_IMAGES_HASH", "")
     if h:
         return f"https://imagedelivery.net/{h}/{cf_image_id}/{variant}"
@@ -82,6 +118,9 @@ async def run_site_rewrite(task_id, params, status_callback, env=None):
     migration_id = params.get("migration_id")
     page_id = params.get("page_id")
     feedback = (params.get("feedback") or "").strip()
+    build_after = bool(params.get("build_after", True))
+    deploy_after = bool(params.get("deploy_after", True))
+    force_tokens = bool(params.get("force_tokens", False))
 
     await status_callback(task_id, "running", "site-rewrite starting")
 
@@ -111,17 +150,30 @@ async def run_site_rewrite(task_id, params, status_callback, env=None):
         await status_callback(task_id, "error", msg)
         return
 
+    # Working tree: /tmp/build/<migration_id>/
+    work_tree = WORK_TREE_BASE / str(migration_id)
+
     # Derive prefix for sibling artifacts: migration/<id>/raw/<sha>/
     raw_prefix = rendered_key.rsplit("/", 1)[0]
-    page_path_sha = raw_prefix.rsplit("/", 1)[-1]
-    rewritten_key = f"migration/{migration_id}/rewritten/{page_path_sha}.html"
+    page_path = page_row.get("path") or "/"
+    route = _path_to_astro_route(page_path)
+    rewritten_r2_key = f"client-sites/migration/{migration_id}/src/{route}.astro"
 
     started = time.time()
     try:
-        # Read artifacts from R2
+        # 1. Ensure working tree
+        await status_callback(task_id, "running", f"preparing working tree {work_tree}")
+        _ensure_work_tree(work_tree)
+
+        # 2. Read captured artifacts from R2
+        await status_callback(task_id, "running", "reading captured artifacts from R2")
         rendered_html = (await r2_client.get_object(rendered_key)).decode("utf-8", "replace")
-        styles_json = json.loads((await r2_client.get_object(f"{raw_prefix}/styles.json")).decode("utf-8"))
-        manifest = json.loads((await r2_client.get_object(f"{raw_prefix}/manifest.json")).decode("utf-8"))
+        styles_json = json.loads(
+            (await r2_client.get_object(f"{raw_prefix}/styles.json")).decode("utf-8")
+        )
+        manifest = json.loads(
+            (await r2_client.get_object(f"{raw_prefix}/manifest.json")).decode("utf-8")
+        )
         try:
             screenshot_desktop = await r2_client.get_object(f"{raw_prefix}/screenshot-desktop.png")
         except Exception:
@@ -129,54 +181,105 @@ async def run_site_rewrite(task_id, params, status_callback, env=None):
 
         section_pngs = await _list_section_screenshots(raw_prefix)
 
-        # Build origin -> CF Images URL map
+        # 3. Asset map
         asset_rows = await get_assets_for_migration(migration_id)
         asset_map = _build_asset_map(asset_rows)
 
-        # Compose user message for Claude
-        user_payload = _build_claude_user_payload(
-            url=page_row.get("url") or "",
+        # 4. Token override (one-shot per migration unless forced)
+        tokens_path = work_tree / "src" / "styles" / "tokens.override.css"
+        tokens_marker = work_tree / ".tokens-applied"
+        if force_tokens or not tokens_marker.exists():
+            await status_callback(task_id, "running", "generating tokens.override.css")
+            overrides = derive_overrides(styles_json)
+            css = render_override_css(overrides)
+            tokens_path.parent.mkdir(parents=True, exist_ok=True)
+            tokens_path.write_text(css, encoding="utf-8")
+            tokens_marker.write_text(datetime.now(timezone.utc).isoformat(), encoding="utf-8")
+            try:
+                await r2_client.put_object(
+                    f"client-sites/migration/{migration_id}/tokens.override.css",
+                    css.encode("utf-8"),
+                    content_type="text/css; charset=utf-8",
+                )
+            except Exception as e:
+                logger.warning(f"tokens.override.css R2 push failed: {e}")
+
+        # 5. Call Claude (with one retry on validation failure)
+        astro_text, validation_error = await _generate_and_validate(
+            status_callback=status_callback,
+            task_id=task_id,
+            page_url=page_row.get("url") or "",
             rendered_html=rendered_html,
             styles_json=styles_json,
             manifest=manifest,
             asset_map=asset_map,
+            screenshot_desktop=screenshot_desktop,
+            section_pngs=section_pngs,
             feedback=feedback,
         )
-        screenshot_blocks = []
-        if screenshot_desktop:
-            screenshot_blocks.append(_image_block(screenshot_desktop, label="origin-desktop"))
-        for idx, png in enumerate(section_pngs[:8]):
-            screenshot_blocks.append(_image_block(png, label=f"origin-section-{idx:02d}"))
 
-        await status_callback(task_id, "running", f"calling Claude {CLAUDE_MODEL}")
-        rewritten_html = await _call_claude(user_payload, screenshot_blocks)
+        if validation_error and not astro_text:
+            await log_error(
+                kind="site-rewrite",
+                migration_id=migration_id,
+                page_id=page_id,
+                error=f"validation failed: {validation_error}",
+            )
+            await patch_page(page_id, {"rewrite_status": "pending"})
+            await status_callback(task_id, "error", f"rewrite validation failed: {validation_error}")
+            return
 
-        # Validate output (best-effort)
-        rewritten_html = _post_validate(rewritten_html, manifest)
+        # 6. Write Astro page to working tree + R2
+        out_path = work_tree / "src" / "pages" / f"{route}.astro"
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(astro_text, encoding="utf-8")
+        try:
+            await r2_client.put_object(
+                rewritten_r2_key,
+                astro_text.encode("utf-8"),
+                content_type="text/plain; charset=utf-8",
+            )
+        except Exception as e:
+            logger.warning(f"R2 push of rewritten .astro failed for {rewritten_r2_key}: {e}")
 
-        # Push to R2
-        await r2_client.put_object(
-            rewritten_key,
-            rewritten_html.encode("utf-8"),
-            content_type="text/html; charset=utf-8",
-        )
+        # 7. Optionally build + deploy
+        rewrite_status = "rewritten"
+        diff_score: Optional[float] = None
+        if build_after:
+            build_ok = await _run_build(work_tree, migration_id, status_callback, task_id)
+            if build_ok and deploy_after:
+                deployed = await _deploy_dist(
+                    work_tree=work_tree,
+                    migration_id=migration_id,
+                    target_prefix=f"client-sites/migration/{migration_id}/dist/",
+                    status_callback=status_callback,
+                    task_id=task_id,
+                )
+                if deployed:
+                    rewrite_status = "published"
+                    await _patch_migration(migration_id, {
+                        "last_built_at": _now(),
+                        "last_deployed_at": _now(),
+                    })
+                else:
+                    await _patch_migration(migration_id, {"last_built_at": _now()})
+            elif build_ok:
+                await _patch_migration(migration_id, {"last_built_at": _now()})
 
-        # Visual diff
-        await status_callback(task_id, "running", "rendering rewritten HTML for visual diff")
-        diff_score = await _visual_diff(rewritten_html, section_pngs)
-
-        await patch_page(page_id, {
-            "rewritten_html_r2_key": rewritten_key,
-            "rewrite_status": "rewritten",
-            "visual_diff_score": diff_score,
-            "rewritten_at": datetime.now(timezone.utc).isoformat(),
-        })
+        # 8. Patch the page row
+        page_patch: dict = {
+            "rewritten_html_r2_key": rewritten_r2_key,
+            "rewrite_status": rewrite_status,
+        }
+        if diff_score is not None:
+            page_patch["visual_diff_score"] = diff_score
+        await patch_page(page_id, page_patch)
 
         elapsed = int(time.time() - started)
         await status_callback(
             task_id,
             "complete",
-            f"site-rewrite done in {elapsed}s, diff={diff_score:.3f}",
+            f"site-rewrite done in {elapsed}s, status={rewrite_status}",
         )
     except Exception as e:
         logger.exception(f"site-rewrite {task_id[:12]} failed")
@@ -189,23 +292,61 @@ async def run_site_rewrite(task_id, params, status_callback, env=None):
         await status_callback(task_id, "error", str(e)[:200])
 
 
-# ── Claude call ──────────────────────────────────────────────────────────────
+# ── Working tree management ─────────────────────────────────────────────────
 
-def _load_system_prompt(feedback: str) -> str:
-    base = SYSTEM_PROMPT_PATH.read_text(encoding="utf-8") if SYSTEM_PROMPT_PATH.exists() else ""
-    if not base:
-        # Fallback minimal prompt — should not happen in production
-        base = (
-            "Rewrite the captured client website page into a single self-contained "
-            "semantic HTML document. Match the origin visually. Output only the HTML."
+def _ensure_work_tree(work_tree: Path) -> None:
+    """Ensure /tmp/build/<id>/ exists and is a clone of the template repo.
+
+    Idempotent: if the marker exists we reuse the tree (preserves
+    operator hand-edits and node_modules).
+    """
+    marker = work_tree / ".cloned"
+    if marker.exists():
+        return
+
+    work_tree.parent.mkdir(parents=True, exist_ok=True)
+    if work_tree.exists():
+        # Stale partial clone — nuke and retry.
+        shutil.rmtree(work_tree, ignore_errors=True)
+
+    cmd = ["git", "clone", "--depth=1", TEMPLATE_REPO_URL, str(work_tree)]
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"git clone {TEMPLATE_REPO_URL} failed (rc={proc.returncode}): "
+            f"{(proc.stderr or proc.stdout)[:500]}"
         )
-    if feedback:
-        base += "\n\nOperator feedback for this iteration:\n" + feedback.strip()
-    return base
+    marker.write_text(datetime.now(timezone.utc).isoformat(), encoding="utf-8")
 
+
+def _path_to_astro_route(page_path: str) -> str:
+    """Map a page row's `path` to a route on disk under src/pages/.
+
+    /              -> index
+    /about         -> about
+    /blog/foo      -> blog/foo
+    Trailing slash collapses to the bare segment.
+    """
+    p = (page_path or "/").strip()
+    if not p.startswith("/"):
+        p = "/" + p
+    if p in ("/", ""):
+        return "index"
+    p = p.rstrip("/")
+    p = p.lstrip("/")
+    # Sanitize unsafe path components — refuse `..`, absolute paths.
+    parts = []
+    for seg in p.split("/"):
+        if not seg or seg in (".", ".."):
+            continue
+        seg = re.sub(r"[^A-Za-z0-9_\-]", "-", seg)
+        parts.append(seg)
+    return "/".join(parts) if parts else "index"
+
+
+# ── Asset map ────────────────────────────────────────────────────────────────
 
 def _build_asset_map(asset_rows: list[dict]) -> dict:
-    """origin_url -> { cf_url, r2_key, alt_text } map for Claude."""
     out: dict[str, dict] = {}
     for r in asset_rows:
         origin = r.get("origin_url")
@@ -223,6 +364,20 @@ def _build_asset_map(asset_rows: list[dict]) -> dict:
     return out
 
 
+# ── Claude call + validation ────────────────────────────────────────────────
+
+def _load_system_prompt(feedback: str) -> str:
+    base = SYSTEM_PROMPT_PATH.read_text(encoding="utf-8") if SYSTEM_PROMPT_PATH.exists() else ""
+    if not base:
+        base = (
+            "Rewrite the captured page as an Astro page component using the "
+            "shared Site.astro layout. Output only the .astro file contents."
+        )
+    if feedback:
+        base += "\n\nOperator feedback for this iteration:\n" + feedback.strip()
+    return base
+
+
 def _build_claude_user_payload(
     *,
     url: str,
@@ -231,21 +386,28 @@ def _build_claude_user_payload(
     manifest: dict,
     asset_map: dict,
     feedback: str,
+    extra_validation_feedback: str = "",
 ) -> str:
-    """Concatenated text body. Claude gets HTML + styles + manifest + asset map."""
     sections = [
         f"# Origin URL\n{url}\n",
         f"# Captured manifest\n```json\n{json.dumps(manifest, ensure_ascii=False)[:60000]}\n```\n",
         f"# Computed styles (curated selectors)\n```json\n{json.dumps(styles_json, ensure_ascii=False)[:30000]}\n```\n",
-        f"# Asset map (origin URL -> Cloudflare delivery URL)\n```json\n{json.dumps(asset_map, ensure_ascii=False)[:60000]}\n```\n",
+        f"# Asset map (origin URL -> Cloudflare delivery URL + dims + alt)\n```json\n{json.dumps(asset_map, ensure_ascii=False)[:60000]}\n```\n",
         f"# Origin rendered HTML\n```html\n{rendered_html[:180000]}\n```\n",
     ]
     if feedback:
         sections.insert(0, f"# Operator feedback\n{feedback}\n")
-    sections.append(
-        "\nProduce the rewritten HTML now. Respond with ONLY the document, "
-        "starting with <!doctype html> and ending with </html>."
-    )
+    if extra_validation_feedback:
+        sections.append(
+            "# Validation feedback from previous attempt\n"
+            f"{extra_validation_feedback}\n"
+            "Regenerate the file. Fix all issues listed above. Output ONLY the .astro file.\n"
+        )
+    else:
+        sections.append(
+            "\nProduce the rewritten Astro page now. Respond with ONLY the .astro "
+            "file contents, starting with the `---` frontmatter delimiter."
+        )
     return "\n".join(sections)
 
 
@@ -260,7 +422,7 @@ def _image_block(png_bytes: bytes, label: str) -> dict:
     }
 
 
-async def _call_claude(user_text: str, image_blocks: list[dict]) -> str:
+async def _call_claude(user_text: str, image_blocks: list[dict], feedback: str) -> str:
     api_key = os.getenv("ANTHROPIC_API_KEY", "")
     headers = {
         "x-api-key": api_key,
@@ -273,7 +435,7 @@ async def _call_claude(user_text: str, image_blocks: list[dict]) -> str:
     body = {
         "model": CLAUDE_MODEL,
         "max_tokens": CLAUDE_MAX_TOKENS,
-        "system": _load_system_prompt(feedback=""),  # feedback already in user_text
+        "system": _load_system_prompt(feedback=feedback),
         "messages": [{"role": "user", "content": content_blocks}],
     }
 
@@ -295,32 +457,281 @@ async def _call_claude(user_text: str, image_blocks: list[dict]) -> str:
         return text
 
 
-def _post_validate(html: str, manifest: dict) -> str:
-    """Strip markdown fences if Claude added them; ensure JSON-LD copied."""
-    h = html.strip()
-    if h.startswith("```"):
-        # Drop opening fence (and language tag) and closing fence
-        nl = h.find("\n")
+def _strip_fences(text: str) -> str:
+    t = text.strip()
+    if t.startswith("```"):
+        nl = t.find("\n")
         if nl != -1:
-            h = h[nl + 1:]
-        if h.endswith("```"):
-            h = h[: -3]
-        h = h.strip()
-    # Ensure all schema_jsonld blocks present (substring check; cheap)
-    for blob in manifest.get("schema_jsonld") or []:
+            t = t[nl + 1:]
+        if t.endswith("```"):
+            t = t[:-3]
+        t = t.strip()
+    return t
+
+
+def _validate_astro(text: str, asset_map: dict) -> Optional[str]:
+    """Return None if valid, else a feedback string describing what's wrong."""
+    if not text or not text.strip():
+        return "Output was empty."
+
+    if not text.lstrip().startswith("---"):
+        return "Output must start with `---` (Astro frontmatter delimiter)."
+
+    # Locate frontmatter block
+    rest = text.lstrip()
+    body_after_open = rest[3:]
+    fm_close = body_after_open.find("\n---")
+    if fm_close == -1:
+        return "Frontmatter block is not closed with a `---` line."
+    frontmatter = body_after_open[:fm_close]
+    body = body_after_open[fm_close + 4:]
+
+    if "import Site from '../layouts/Site.astro'" not in frontmatter \
+       and 'import Site from "../layouts/Site.astro"' not in frontmatter:
+        return (
+            "Frontmatter must contain `import Site from '../layouts/Site.astro';` "
+            "exactly."
+        )
+
+    # Body must wrap content in <Site ...>...</Site>
+    if "<Site" not in body or "</Site>" not in body:
+        return "Body must wrap content in `<Site meta={meta} schema={schema}>...</Site>`."
+
+    # No raw <html>/<body>/<head>
+    forbidden = ["<html", "<head>", "<body", "<!doctype", "<!DOCTYPE"]
+    for tag in forbidden:
+        if tag in body or tag in frontmatter:
+            return f"Output must not contain `{tag}` — the layout owns the document shell."
+
+    # No inline <script>
+    if re.search(r"<script\b", body, re.IGNORECASE):
+        return "Output must not contain `<script>` tags."
+
+    # Must declare meta and schema
+    if "const meta" not in frontmatter:
+        return "Frontmatter must define `const meta = { ... }`."
+    if "const schema" not in frontmatter:
+        return "Frontmatter must define `const schema = [ ... ]`."
+
+    # Body must reference at least one component import OR semantic HTML.
+    component_imports = re.findall(
+        r"import\s+(\w+)\s+from\s+['\"]\.\./components/(\w+)\.astro['\"]",
+        frontmatter,
+    )
+    used_any_component = any(
+        re.search(rf"<{name}\b", body) for name, _ in component_imports
+    )
+    has_semantic = bool(re.search(r"<(section|article|header|main|aside)\b", body))
+    if not used_any_component and not has_semantic:
+        return (
+            "Body must use at least one shared component (Hero, Section, "
+            "TwoColumn, Button, ImageBlock, BulletList) or semantic HTML "
+            "tag (<section>, <article>, <header>, <main>, <aside>)."
+        )
+
+    # ImageBlock src values must come from the asset map (best-effort —
+    # only enforce when ImageBlock is actually used).
+    if "<ImageBlock" in body and asset_map:
+        cf_urls = {v.get("cf_url") for v in asset_map.values() if v.get("cf_url")}
+        for m in re.finditer(r'<ImageBlock\s+[^>]*src=["\']([^"\']+)["\']', body):
+            src = m.group(1)
+            if cf_urls and src not in cf_urls:
+                return (
+                    f"ImageBlock src `{src}` is not in the asset map. Use only "
+                    "URLs listed under `cf_url` in the asset map."
+                )
+
+    return None
+
+
+async def _generate_and_validate(
+    *,
+    status_callback,
+    task_id: str,
+    page_url: str,
+    rendered_html: str,
+    styles_json: dict,
+    manifest: dict,
+    asset_map: dict,
+    screenshot_desktop: Optional[bytes],
+    section_pngs: list[bytes],
+    feedback: str,
+) -> tuple[Optional[str], Optional[str]]:
+    """Returns (astro_text, error). astro_text is None on terminal failure."""
+    extra_feedback = ""
+    last_error: Optional[str] = None
+
+    for attempt in (1, 2):
+        await status_callback(
+            task_id,
+            "running",
+            f"calling Claude {CLAUDE_MODEL} (attempt {attempt})",
+        )
+
+        user_payload = _build_claude_user_payload(
+            url=page_url,
+            rendered_html=rendered_html,
+            styles_json=styles_json,
+            manifest=manifest,
+            asset_map=asset_map,
+            feedback=feedback,
+            extra_validation_feedback=extra_feedback,
+        )
+        screenshot_blocks = []
+        if screenshot_desktop:
+            screenshot_blocks.append(_image_block(screenshot_desktop, "origin-desktop"))
+        for idx, png in enumerate(section_pngs[:8]):
+            screenshot_blocks.append(_image_block(png, f"origin-section-{idx:02d}"))
+
         try:
-            needle = json.dumps(blob, ensure_ascii=False)[:120] if isinstance(blob, (dict, list)) else str(blob)[:120]
-        except Exception:
-            continue
-        if needle and needle not in h:
-            logger.warning(f"rewrite missing JSON-LD fragment: {needle[:60]}...")
-    return h
+            raw = await _call_claude(user_payload, screenshot_blocks, feedback=feedback)
+        except Exception as e:
+            return None, f"Claude call failed: {e}"
+
+        astro_text = _strip_fences(raw)
+        err = _validate_astro(astro_text, asset_map)
+        if err is None:
+            return astro_text, None
+        logger.warning(f"site-rewrite validation attempt {attempt} failed: {err}")
+        last_error = err
+        extra_feedback = err
+
+    return None, last_error
 
 
-# ── Visual diff ──────────────────────────────────────────────────────────────
+# ── Build + deploy ──────────────────────────────────────────────────────────
+
+async def _run_build(work_tree: Path, migration_id: str, status_callback, task_id: str) -> bool:
+    installed_marker = work_tree / "node_modules" / ".installed"
+    if not installed_marker.exists():
+        await status_callback(task_id, "running", "npm install --omit=dev")
+        rc, log = await _run_subprocess(
+            ["npm", "install", "--omit=dev"],
+            cwd=work_tree,
+            timeout=NPM_INSTALL_TIMEOUT_S,
+        )
+        if rc != 0:
+            await log_error(
+                kind="site-rewrite-build",
+                migration_id=migration_id,
+                page_id=None,
+                error=f"npm install failed rc={rc}: {log[-1500:]}",
+            )
+            await status_callback(task_id, "error", f"npm install failed rc={rc}")
+            return False
+        installed_marker.parent.mkdir(parents=True, exist_ok=True)
+        installed_marker.write_text(_now(), encoding="utf-8")
+
+    public_url = os.getenv("PUBLIC_SITE_URL", "")
+    env = dict(os.environ)
+    if public_url:
+        env["PUBLIC_SITE_URL"] = public_url
+
+    await status_callback(task_id, "running", "astro build")
+    rc, log = await _run_subprocess(
+        ["npx", "astro", "build"],
+        cwd=work_tree,
+        timeout=ASTRO_BUILD_TIMEOUT_S,
+        env=env,
+    )
+    if rc != 0:
+        await log_error(
+            kind="site-rewrite-build",
+            migration_id=migration_id,
+            page_id=None,
+            error=f"astro build failed rc={rc}: {log[-1500:]}",
+        )
+        await status_callback(task_id, "error", f"astro build failed rc={rc}")
+        return False
+
+    return True
+
+
+async def _run_subprocess(
+    cmd: list[str],
+    *,
+    cwd: Path,
+    timeout: int,
+    env: Optional[dict] = None,
+) -> tuple[int, str]:
+    """Run a subprocess, capture combined output, surface clear timeout error."""
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        cwd=str(cwd),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+        env=env,
+    )
+    try:
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        return 124, f"TIMEOUT after {timeout}s running {' '.join(cmd)}"
+    return proc.returncode or 0, stdout.decode("utf-8", "replace")
+
+
+def _content_type_for(path: Path) -> str:
+    return CONTENT_TYPES.get(path.suffix.lower(), "application/octet-stream")
+
+
+def _cache_control_for(path: Path) -> str:
+    if path.suffix.lower() == ".html":
+        return CACHE_CONTROL_HTML
+    return CACHE_CONTROL_IMMUTABLE
+
+
+async def _deploy_dist(
+    *,
+    work_tree: Path,
+    migration_id: str,
+    target_prefix: str,
+    status_callback,
+    task_id: str,
+) -> bool:
+    dist = work_tree / "dist"
+    if not dist.is_dir():
+        await log_error(
+            kind="site-rewrite-deploy",
+            migration_id=migration_id,
+            page_id=None,
+            error=f"dist/ not found at {dist}",
+        )
+        return False
+
+    if not target_prefix.endswith("/"):
+        target_prefix += "/"
+
+    files = [p for p in dist.rglob("*") if p.is_file()]
+    await status_callback(task_id, "running", f"deploying {len(files)} files to {target_prefix}")
+
+    uploaded = 0
+    for fp in files:
+        rel = fp.relative_to(dist).as_posix()
+        key = f"{target_prefix}{rel}"
+        try:
+            body = fp.read_bytes()
+            await r2_client.put_object(
+                key,
+                body,
+                content_type=_content_type_for(fp),
+                cache_control=_cache_control_for(fp),
+            )
+            uploaded += 1
+        except Exception as e:
+            logger.warning(f"R2 PUT {key} failed: {e}")
+
+    if uploaded == 0:
+        return False
+    await status_callback(task_id, "running", f"deployed {uploaded}/{len(files)} files")
+    return True
+
+
+# ── Section screenshot fetcher ───────────────────────────────────────────────
 
 async def _list_section_screenshots(raw_prefix: str) -> list[bytes]:
-    """Try keys 00..23. R2 has no LIST without IAM scope — probe sequentially."""
     out: list[bytes] = []
     for idx in range(24):
         try:
@@ -331,68 +742,42 @@ async def _list_section_screenshots(raw_prefix: str) -> list[bytes]:
     return out
 
 
-async def _visual_diff(rewritten_html: str, origin_sections: list[bytes]) -> float:
-    """Render rewritten HTML, screenshot, compute mean per-section L1 diff in
-    0..1. If origin_sections is empty we return 0.0 (no signal).
+# ── site_migrations row patcher (best-effort REST PATCH) ────────────────────
 
-    Note: the rewritten HTML's section count + ordering may differ from the
-    origin's. We compute a single full-page diff against the origin's full
-    desktop screenshot reconstructed from the section PNGs (vertical concat),
-    which is a lossy but stable proxy. Operator gets the score; Claude rerun
-    can use feedback to address mismatches.
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+async def _patch_migration(migration_id: str, payload: dict) -> bool:
+    """PATCH site_migrations by id. Best-effort; logs and returns False on
+    failure. Tolerant of missing columns (PostgREST 400 on unknown column —
+    spec §2 + §11A added last_built_at/last_deployed_at; if migration not
+    yet applied, we log + continue).
     """
-    if not origin_sections:
-        return 0.0
+    sb_url = os.getenv("SUPABASE_URL", "")
+    sb_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
+    if not sb_url or not sb_key or not migration_id:
+        return False
+    headers = {
+        "apikey": sb_key,
+        "Authorization": f"Bearer {sb_key}",
+        "Content-Type": "application/json",
+        "Prefer": "return=minimal",
+    }
     try:
-        from PIL import Image, ImageChops
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.patch(
+                f"{sb_url}/rest/v1/site_migrations?id=eq.{migration_id}",
+                json=payload,
+                headers=headers,
+            )
+            if resp.status_code >= 300:
+                logger.warning(
+                    f"patch_migration {migration_id} {resp.status_code}: "
+                    f"{resp.text[:300]}"
+                )
+                return False
+            return True
     except Exception as e:
-        logger.warning(f"PIL not available for visual diff: {e}")
-        return 0.0
-
-    rewritten_png = None
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(args=["--no-sandbox", "--disable-dev-shm-usage"])
-        try:
-            context = await browser.new_context(viewport=VISUAL_DIFF_VIEWPORT)
-            page = await context.new_page()
-            await page.set_content(rewritten_html, wait_until="domcontentloaded")
-            try:
-                await page.wait_for_load_state("networkidle", timeout=8000)
-            except Exception:
-                pass
-            rewritten_png = await page.screenshot(full_page=True, type="png")
-            await context.close()
-        finally:
-            await browser.close()
-
-    if not rewritten_png:
-        return 1.0
-
-    # Build origin reference image by vertically concatenating sections.
-    origin_imgs = [Image.open(io.BytesIO(b)).convert("RGB") for b in origin_sections]
-    if not origin_imgs:
-        return 0.0
-    width = max(im.width for im in origin_imgs)
-    height = sum(im.height for im in origin_imgs)
-    origin_ref = Image.new("RGB", (width, height), (255, 255, 255))
-    y = 0
-    for im in origin_imgs:
-        origin_ref.paste(im, (0, y))
-        y += im.height
-
-    rewritten_img = Image.open(io.BytesIO(rewritten_png)).convert("RGB")
-    # Resize rewritten to origin reference size for fair pixel compare.
-    rewritten_resized = rewritten_img.resize(origin_ref.size)
-    diff = ImageChops.difference(origin_ref, rewritten_resized)
-    bbox = diff.getbbox()
-    if not bbox:
-        return 0.0
-    # Mean pixel L1 across all channels, normalized to 0..1
-    hist = diff.histogram()  # 256 * 3 bins
-    total_pixels = origin_ref.size[0] * origin_ref.size[1]
-    weighted = 0
-    for ch in range(3):
-        for v in range(256):
-            weighted += v * hist[ch * 256 + v]
-    mean_l1 = weighted / max(1, total_pixels * 3)
-    return round(mean_l1 / 255.0, 4)
+        logger.warning(f"patch_migration {migration_id} failed: {e}")
+        return False
