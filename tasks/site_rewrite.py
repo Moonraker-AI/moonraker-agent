@@ -711,6 +711,14 @@ async def _run_build(work_tree: Path, migration_id: str, status_callback, task_i
     if public_url:
         env["PUBLIC_SITE_URL"] = public_url
 
+    # Staging dist is served from the Worker under /serve/migration/<id>/dist,
+    # so Astro must emit asset hrefs prefixed with that path. Production
+    # cutover sets PUBLIC_BASE_PATH=/ explicitly via deploy_to=production.
+    env.setdefault(
+        "PUBLIC_BASE_PATH",
+        f"/serve/migration/{migration_id}/dist",
+    )
+
     await status_callback(task_id, "running", "astro build")
     rc, log = await _run_subprocess(
         ["npx", "astro", "build"],
