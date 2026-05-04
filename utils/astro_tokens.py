@@ -180,37 +180,72 @@ def _is_button_selector(sel: str) -> bool:
         return True
     if "a.btn" in s or 'a[class*="btn"]' in s:
         return True
+    # Squarespace
+    if "sqs-block-button-element" in s or "sqs-button-element" in s:
+        return True
     return False
 
 
 def _is_primary_button(sel: str) -> bool:
     s = sel.lower()
-    return any(t in s for t in ("primary", "main", "filled", "solid", "submit"))
+    if any(t in s for t in ("primary", "main", "filled", "solid", "submit")):
+        return True
+    # Squarespace's primary modifier
+    if "--primary" in s:
+        return True
+    return False
 
 
 def _is_secondary_button(sel: str) -> bool:
     s = sel.lower()
-    return any(t in s for t in ("secondary", "outline", "ghost", "tertiary", "alt"))
+    if any(t in s for t in ("secondary", "outline", "ghost", "tertiary", "alt")):
+        return True
+    if "--secondary" in s or "--tertiary" in s:
+        return True
+    return False
 
 
 def _is_nav_selector(sel: str) -> bool:
     s = sel.lower()
-    return s.startswith("nav") or "navbar" in s or "site-nav" in s or s.startswith("header")
+    if s.startswith("nav") or "navbar" in s or "site-nav" in s or s.startswith("header"):
+        return True
+    # Squarespace
+    if any(t in s for t in (
+        ".header-nav", ".header-title", ".header-actions", ".header-display",
+        ".site-title", ".header-menu",
+    )):
+        return True
+    return False
 
 
 def _is_hero_selector(sel: str) -> bool:
     s = sel.lower()
-    return ".hero" in s or s == "hero" or "banner" in s or s.startswith("section.hero")
+    if ".hero" in s or s == "hero" or "banner" in s or s.startswith("section.hero"):
+        return True
+    # Squarespace banner sections
+    if any(t in s for t in (".banner-section", ".banner-text", ".section-banner")):
+        return True
+    return False
 
 
 def _is_footer_selector(sel: str) -> bool:
     s = sel.lower()
-    return s.startswith("footer") or "site-footer" in s or s == ".footer"
+    if s.startswith("footer") or "site-footer" in s or s == ".footer":
+        return True
+    # Squarespace footer blocks
+    if any(t in s for t in (".footer-blocks", ".sqs-block-summary", ".user-items-list")):
+        return True
+    return False
 
 
 def _is_section_selector(sel: str) -> bool:
     s = sel.lower()
-    return s == "section" or s.startswith("section ") or s == ".section"
+    if s == "section" or s.startswith("section ") or s == ".section":
+        return True
+    # Squarespace page sections
+    if any(t in s for t in (".page-section", ".content-wrapper", ".sqs-layout")):
+        return True
+    return False
 
 
 def bin_styles_by_role(styles: dict) -> dict[str, dict]:

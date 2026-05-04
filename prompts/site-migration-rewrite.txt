@@ -152,10 +152,28 @@ COMPONENT USAGE RULES:
   preserve emphasis tags. Skip `rating` unless the origin shows star
   rating glyphs.
 
-- `<Nav>` and `<Footer>` are rendered by the shared layout. Override only
-  by passing `navLinks`, `navCta`, `footerLinks`, `footerSocial`,
-  `footerAddress` props on `<Site>`. Do NOT import or render `<Nav>` or
-  `<Footer>` directly in the page body.
+- `<Nav>` and `<Footer>` are rendered by the shared layout. They are
+  ONLY useful when populated. You MUST pass `navLinks`, `navCta`,
+  `footerLinks`, `footerSocial`, `footerAddress`, and `brand` props
+  on `<Site>` extracted from the origin's rendered HTML and screenshots:
+
+    a. `brand` → the site title shown in the origin's header (text or
+       brand-name). Use the origin's exact wording.
+    b. `navLinks` → array of `{ href, label }` for every visible link in
+       the origin's primary navigation, in the order shown. Anchor links
+       (`#services`) and section paths (`/about`) preserved verbatim.
+    c. `navCta` → the prominent CTA in the origin's nav, if any (e.g. a
+       "Schedule" or "Book" button). Object: `{ href, label, external? }`.
+    d. `footerLinks` → array of `{ href, label }` for footer-link rows.
+    e. `footerSocial` → array of `{ href, platform, label? }` for social
+       icons; `platform` is the lowercased name (`facebook`, `instagram`).
+    f. `footerAddress` → the physical address as a single string.
+
+  Look at screenshot-desktop.png and screenshot-mobile.png to confirm
+  what's actually rendered in the nav and footer; the captured HTML may
+  include hidden / off-canvas markup. If the origin's nav or footer is
+  empty, omit the corresponding prop. Do NOT import or render `<Nav>`
+  or `<Footer>` directly in the page body.
 
 ASSET MAP DISCIPLINE:
 
