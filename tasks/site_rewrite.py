@@ -446,13 +446,54 @@ def _build_claude_user_payload(
     return "\n".join(sections)
 
 
+# Anthropic vision API rejects single images larger than 5 MB raw bytes
+# (server returns 400 invalid_request_error). Full-page Squarespace
+# captures routinely exceed 7 MB. Cap at 4 MB to leave headroom for the
+# 33% base64 expansion + multipart envelope. Anthropic also recommends
+# ≤1568 px on the long edge for best vision performance.
+_MAX_IMAGE_BYTES = 4 * 1024 * 1024
+_MAX_IMAGE_LONG_EDGE = 1568
+
+
+def _compress_for_anthropic(png_bytes: bytes) -> tuple[bytes, str]:
+    """Return (bytes, media_type) suitable for the Anthropic vision API.
+
+    Pass-through if the input is already under the size cap. Otherwise
+    resize the long edge to <=1568 px and re-encode as JPEG quality 85,
+    which is what Anthropic's documentation recommends for full-page
+    screenshots.
+    """
+    if len(png_bytes) <= _MAX_IMAGE_BYTES:
+        return png_bytes, "image/png"
+    try:
+        from PIL import Image
+    except ImportError:
+        # Pillow ships transitively via qrcode[pil]; if missing, surface
+        # raw bytes and let Anthropic 400 the request — caller handles it.
+        return png_bytes, "image/png"
+
+    import io
+    img = Image.open(io.BytesIO(png_bytes))
+    if img.mode not in ("RGB", "L"):
+        img = img.convert("RGB")
+    w, h = img.size
+    long_edge = max(w, h)
+    if long_edge > _MAX_IMAGE_LONG_EDGE:
+        scale = _MAX_IMAGE_LONG_EDGE / float(long_edge)
+        img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=85, optimize=True)
+    return buf.getvalue(), "image/jpeg"
+
+
 def _image_block(png_bytes: bytes, label: str) -> dict:
+    data, media_type = _compress_for_anthropic(png_bytes)
     return {
         "type": "image",
         "source": {
             "type": "base64",
-            "media_type": "image/png",
-            "data": base64.b64encode(png_bytes).decode("ascii"),
+            "media_type": media_type,
+            "data": base64.b64encode(data).decode("ascii"),
         },
     }
 
