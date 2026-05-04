@@ -39,6 +39,7 @@ from tasks.surge_status_check import check_surge_status
 from tasks.design_audit import run_design_audit
 from tasks.site_capture import run_site_capture
 from tasks.site_rewrite import run_site_rewrite
+from tasks.site_build import run_site_build
 
 load_dotenv()
 
@@ -54,7 +55,7 @@ logger = logging.getLogger("agent")
 from utils.log_redact import install as _install_log_redact
 _install_log_redact()
 
-AGENT_VERSION = "0.8.0"
+AGENT_VERSION = "0.9.0"
 
 app = FastAPI(
     title="Moonraker Agent Service",
@@ -249,13 +250,48 @@ class SiteCaptureRequest(BaseModel):
 
 
 class SiteRewriteRequest(BaseModel):
-    """site-migration job 2: Claude rewrite + visual diff QA.
+    """site-migration job 2 (v4 / Astro): Claude generates an Astro page
+    component, agent writes it to a per-migration working tree, optionally
+    runs `astro build` and deploys `dist/` to R2.
 
-    Spec: docs/site-migration-agent-job-spec.md §2.
+    Spec: docs/site-migration-agent-job-spec.md §2 (Astro output)
+          docs/site-migration-spec.md §8 + §11A.
     """
     migration_id: str
     page_id: str
     feedback: Optional[str] = None
+    # Run §2.6 build (npm install + astro build) after the rewrite finishes.
+    # Default true — single-page rewrite is followed immediately by build.
+    # Set false when batching many pages; the operator triggers a single
+    # build via /tasks/site-build once all pages are rewritten.
+    build_after: bool = True
+    # Run §2.7 deploy (push dist/ to R2) after the build succeeds.
+    # Effective only when build_after=true.
+    deploy_after: bool = True
+    # Force regeneration of src/styles/tokens.override.css from styles.json.
+    # Default false: tokens are generated on the first rewrite per migration
+    # and reused thereafter. Set true after operator overrides need re-derived.
+    force_tokens: bool = False
+
+
+class SiteBuildRequest(BaseModel):
+    """site-migration job 3 (v4 add): operator-triggered build + deploy
+    without doing a per-page rewrite. Used after hand-edits to .astro
+    files in the per-migration working tree, or after token override
+    changes.
+
+    Spec: docs/site-migration-agent-job-spec.md §3.
+    """
+    migration_id: str
+    deploy_to: str = "staging"  # 'staging' | 'production'
+
+    @field_validator("deploy_to")
+    @classmethod
+    def _v_deploy_to(cls, v: str) -> str:
+        v = (v or "").strip().lower()
+        if v not in ("staging", "production"):
+            raise ValueError("deploy_to must be 'staging' or 'production'")
+        return v
 
 
 class NeoOverlayRequest(BaseModel):
@@ -639,7 +675,41 @@ async def create_site_rewrite(request: SiteRewriteRequest):
     asyncio.create_task(_run_site_rewrite_with_lock(task_id))
     logger.info(
         f"Queued site-rewrite {task_id[:18]} migration={request.migration_id} "
-        f"page={request.page_id} feedback={'yes' if request.feedback else 'no'}"
+        f"page={request.page_id} feedback={'yes' if request.feedback else 'no'} "
+        f"build_after={request.build_after} deploy_after={request.deploy_after}"
+    )
+    return {"task_id": task_id, "queued": True, "status": "queued"}
+
+
+@app.post("/tasks/site-build", dependencies=[Depends(verify_api_key)])
+async def create_site_build(request: SiteBuildRequest):
+    """Site-migration job 3: operator-triggered build + deploy of an
+    existing per-migration working tree.
+
+    Spec: docs/site-migration-agent-job-spec.md §3. No browser usage —
+    runs Astro build via subprocess + R2 deploy walker. Acquires the
+    browser lock anyway to keep heavy work serialized with site-rewrite
+    visual diffs (CPU + disk I/O).
+    """
+    task_id = f"site-build-{uuid.uuid4()}"
+    now = datetime.now(timezone.utc).isoformat()
+
+    tasks[task_id] = {
+        "task_id": task_id,
+        "type": "site-build",
+        "status": "queued",
+        "message": "Site build queued",
+        "created_at": now,
+        "updated_at": now,
+        "error": None,
+        "duration_seconds": None,
+        "request": request.model_dump(),
+    }
+
+    asyncio.create_task(_run_site_build_with_lock(task_id))
+    logger.info(
+        f"Queued site-build {task_id[:18]} migration={request.migration_id} "
+        f"deploy_to={request.deploy_to}"
     )
     return {"task_id": task_id, "queued": True, "status": "queued"}
 
@@ -1132,6 +1202,36 @@ async def _run_site_rewrite_with_lock(task_id: str):
             )
         except Exception as e:
             logger.exception(f"site-rewrite {task_id[:18]} failed")
+            update_task(
+                task_id,
+                "error",
+                f"Unexpected error: {str(e)[:200]}",
+                error=str(e),
+            )
+        await asyncio.sleep(LIGHT_TASK_COOLDOWN)
+
+
+async def _run_site_build_with_lock(task_id: str):
+    """Tier 2 (Light Browser): operator-triggered Astro build + R2 deploy.
+
+    No browser is launched, but we acquire the lock anyway: `npm install`
+    + `astro build` are heavy on CPU, RAM and disk I/O on the 4GB VPS,
+    and overlapping a build with a Surge audit Chrome instance would risk
+    OOM. Cooldown is light because no Chrome process needs reaping.
+
+    Spec: docs/site-migration-agent-job-spec.md §3.
+    """
+    async with browser_lock:
+        update_task(task_id, "running", "Starting site build")
+        try:
+            await run_site_build(
+                task_id=task_id,
+                params=tasks[task_id]["request"],
+                status_callback=_async_update_task,
+                env=None,
+            )
+        except Exception as e:
+            logger.exception(f"site-build {task_id[:18]} failed")
             update_task(
                 task_id,
                 "error",
