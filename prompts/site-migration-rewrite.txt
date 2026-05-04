@@ -208,6 +208,21 @@ CSS / TOKENS:
 - You do NOT pick literal colors, fonts, or sizes. The override file owns
   the palette.
 
+JS STRING SAFETY (mandatory — common cause of build failures):
+
+- Any string literal in the frontmatter that may contain an apostrophe
+  ('s, isn't, won't, you're, we're, can't, who's, etc.) MUST use either
+  DOUBLE quotes ("...") or BACKTICKS (`...`). Never single quotes.
+- This applies to `q` and `a` fields in Accordion items, `quote` in
+  Testimonial, `description` in meta, `label` strings in nav/footer
+  arrays, and ANY object literal value coming from the origin's body
+  copy.
+- Any string literal that may contain a double quote MUST use single
+  quotes or backticks.
+- When in doubt, use backticks — they tolerate both ' and ".
+- Inside JSX (the body markup), text content does NOT need quoting,
+  so apostrophes are fine in plain `<p>It's time...</p>`.
+
 CONTENT FIDELITY:
 
 - Body copy verbatim. Headings verbatim. Lists verbatim. Order verbatim.
