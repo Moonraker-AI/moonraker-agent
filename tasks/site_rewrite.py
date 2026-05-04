@@ -69,8 +69,11 @@ PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
 SYSTEM_PROMPT_PATH = PROMPTS_DIR / "site-migration-rewrite.txt"
 
 TEMPLATE_REPO_URL = os.getenv(
-    "SITE_TEMPLATE_REPO_URL",
-    "https://github.com/Moonraker-AI/moonraker-site-template.git",
+    "TEMPLATE_REPO_URL",
+    os.getenv(
+        "SITE_TEMPLATE_REPO_URL",
+        "https://github.com/Moonraker-AI/moonraker-site-template.git",
+    ),
 )
 WORK_TREE_BASE = Path(os.getenv("SITE_BUILD_BASE", "/tmp/build"))
 
