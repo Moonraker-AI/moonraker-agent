@@ -20,6 +20,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     wget \
     curl \
     gnupg \
+    git \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
