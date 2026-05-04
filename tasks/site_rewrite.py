@@ -14,13 +14,13 @@ Pipeline:
      row from Supabase. Read site_migration_assets for the asset map.
   3. On first rewrite for the migration (or force_tokens=true), generate
      src/styles/tokens.override.css from styles.json (spec §2.5) and push
-     a copy to R2 at client-sites/migration/<id>/tokens.override.css.
+     a copy to R2 at migration/<id>/tokens.override.css.
   4. Call Claude with the system prompt at prompts/site-migration-rewrite.txt
      and the captured screenshots as multimodal content.
   5. Validate output: must be a valid Astro page (frontmatter, Site import,
      <Site> wrapper, asset-map-only image refs). Retry once with feedback.
   6. Map page.path -> src/pages/<route>.astro on disk. Write the file.
-     Push a copy to R2 at client-sites/migration/<id>/src/<route>.astro.
+     Push a copy to R2 at migration/<id>/src/<route>.astro.
   7. If build_after=true (default): run §2.6 build + §2.7 deploy. Patch
      site_migrations.last_built_at + last_deployed_at.
   8. Patch the page row with rewritten_html_r2_key (the .astro key),
@@ -171,7 +171,7 @@ async def run_site_rewrite(task_id, params, status_callback, env=None):
     raw_prefix = rendered_key.rsplit("/", 1)[0]
     page_path = page_row.get("path") or "/"
     route = _path_to_astro_route(page_path)
-    rewritten_r2_key = f"client-sites/migration/{migration_id}/src/{route}.astro"
+    rewritten_r2_key = f"migration/{migration_id}/src/{route}.astro"
 
     started = time.time()
     try:
@@ -211,7 +211,7 @@ async def run_site_rewrite(task_id, params, status_callback, env=None):
             tokens_marker.write_text(datetime.now(timezone.utc).isoformat(), encoding="utf-8")
             try:
                 await r2_client.put_object(
-                    f"client-sites/migration/{migration_id}/tokens.override.css",
+                    f"migration/{migration_id}/tokens.override.css",
                     css.encode("utf-8"),
                     content_type="text/css; charset=utf-8",
                 )
@@ -265,7 +265,7 @@ async def run_site_rewrite(task_id, params, status_callback, env=None):
                 deployed = await _deploy_dist(
                     work_tree=work_tree,
                     migration_id=migration_id,
-                    target_prefix=f"client-sites/migration/{migration_id}/dist/",
+                    target_prefix=f"migration/{migration_id}/dist/",
                     status_callback=status_callback,
                     task_id=task_id,
                 )

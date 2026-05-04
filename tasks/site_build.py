@@ -14,8 +14,8 @@ Pipeline (mirrors §2.6 build + §2.7 deploy, with target prefix selectable):
      if absent — there's nothing to build.
   2. Run npm install (cached) + astro build.
   3. Walk dist/ and push every file to R2:
-       deploy_to=staging    -> client-sites/migration/<id>/staging/
-       deploy_to=production -> client-sites/migration/<id>/dist/
+       deploy_to=staging    -> migration/<id>/staging/
+       deploy_to=production -> migration/<id>/dist/
      With Content-Type and Cache-Control by extension (spec §2.7).
   4. Best-effort: re-run a per-section pixel diff for every captured page
      in the migration. (TODO: implement when staging origin screenshots
@@ -95,9 +95,9 @@ async def run_site_build(task_id, params, status_callback, env=None):
 
     # 2. Deploy
     if deploy_to == "staging":
-        target_prefix = f"client-sites/migration/{migration_id}/staging/"
+        target_prefix = f"migration/{migration_id}/staging/"
     else:
-        target_prefix = f"client-sites/migration/{migration_id}/dist/"
+        target_prefix = f"migration/{migration_id}/dist/"
 
     deployed = await _deploy_dist(
         work_tree=work_tree,
