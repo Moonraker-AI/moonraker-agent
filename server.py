@@ -40,6 +40,7 @@ from tasks.design_audit import run_design_audit
 from tasks.site_capture import run_site_capture
 from tasks.site_rewrite import run_site_rewrite
 from tasks.site_build import run_site_build
+from tasks.site_diff import run_site_diff
 
 load_dotenv()
 
@@ -292,6 +293,18 @@ class SiteBuildRequest(BaseModel):
         if v not in ("staging", "production"):
             raise ValueError("deploy_to must be 'staging' or 'production'")
         return v
+
+
+class SiteDiffRequest(BaseModel):
+    """site-migration job 4: visual diff staging vs origin for one page.
+
+    Spec: docs/site-migration-agent-job-spec.md §4.
+    Captures staging URL at desktop + mobile, computes pixel-diff score
+    against origin's screenshot-{desktop,mobile}.png, writes overlay PNG
+    to R2 and visual_diff_score onto site_migration_pages.
+    """
+    migration_id: str
+    page_id: str
 
 
 class NeoOverlayRequest(BaseModel):
@@ -710,6 +723,38 @@ async def create_site_build(request: SiteBuildRequest):
     logger.info(
         f"Queued site-build {task_id[:18]} migration={request.migration_id} "
         f"deploy_to={request.deploy_to}"
+    )
+    return {"task_id": task_id, "queued": True, "status": "queued"}
+
+
+@app.post("/tasks/site-diff", dependencies=[Depends(verify_api_key)])
+async def create_site_diff(request: SiteDiffRequest):
+    """Site-migration job 4: visual diff staging vs origin for one page.
+
+    Spec: docs/site-migration-agent-job-spec.md §4. Renders the staging
+    URL in a fresh Playwright instance at the same viewports as origin
+    capture, computes pixel-diff scores, writes overlay PNG to R2 and
+    `visual_diff_score` onto site_migration_pages.
+    """
+    task_id = f"site-diff-{uuid.uuid4()}"
+    now = datetime.now(timezone.utc).isoformat()
+
+    tasks[task_id] = {
+        "task_id": task_id,
+        "type": "site-diff",
+        "status": "queued",
+        "message": "Site diff queued",
+        "created_at": now,
+        "updated_at": now,
+        "error": None,
+        "duration_seconds": None,
+        "request": request.model_dump(),
+    }
+
+    asyncio.create_task(_run_site_diff_with_lock(task_id))
+    logger.info(
+        f"Queued site-diff {task_id[:18]} migration={request.migration_id} "
+        f"page={request.page_id}"
     )
     return {"task_id": task_id, "queued": True, "status": "queued"}
 
@@ -1232,6 +1277,28 @@ async def _run_site_build_with_lock(task_id: str):
             )
         except Exception as e:
             logger.exception(f"site-build {task_id[:18]} failed")
+            update_task(
+                task_id,
+                "error",
+                f"Unexpected error: {str(e)[:200]}",
+                error=str(e),
+            )
+        await asyncio.sleep(LIGHT_TASK_COOLDOWN)
+
+
+async def _run_site_diff_with_lock(task_id: str):
+    """Tier 2 (Light Browser): visual diff staging vs origin."""
+    async with browser_lock:
+        update_task(task_id, "running", "Starting site diff")
+        try:
+            await run_site_diff(
+                task_id=task_id,
+                params=tasks[task_id]["request"],
+                status_callback=_async_update_task,
+                env=None,
+            )
+        except Exception as e:
+            logger.exception(f"site-diff {task_id[:18]} failed")
             update_task(
                 task_id,
                 "error",

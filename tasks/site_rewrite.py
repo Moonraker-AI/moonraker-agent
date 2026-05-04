@@ -302,6 +302,10 @@ async def run_site_rewrite(task_id, params, status_callback, env=None):
                         "last_built_at": _now(),
                         "last_deployed_at": _now(),
                     })
+                    # Auto-trigger visual diff in the background. Goes via
+                    # HTTP to the agent's own queue so it picks up the
+                    # browser_lock cleanly after this rewrite releases it.
+                    asyncio.create_task(_dispatch_site_diff(migration_id, page_id))
                 else:
                     await _patch_migration(migration_id, {"last_built_at": _now()})
             elif build_ok:
@@ -518,6 +522,38 @@ def _compress_for_anthropic(png_bytes: bytes) -> tuple[bytes, str]:
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=85, optimize=True)
     return buf.getvalue(), "image/jpeg"
+
+
+async def _dispatch_site_diff(migration_id: str, page_id: str) -> None:
+    """Fire-and-forget POST to the agent's own /tasks/site-diff endpoint.
+
+    Goes through the agent's task queue so it picks up the browser_lock
+    cleanly AFTER this rewrite releases it. Failures are logged but
+    don't fail the rewrite.
+    """
+    import httpx
+    api_key = os.getenv("AGENT_API_KEY", "")
+    if not api_key:
+        logger.warning("site-diff auto-trigger skipped: AGENT_API_KEY missing")
+        return
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(
+                "http://localhost:8000/tasks/site-diff",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={"migration_id": migration_id, "page_id": page_id},
+            )
+            if resp.status_code >= 300:
+                logger.warning(
+                    f"site-diff auto-trigger non-2xx: {resp.status_code} {resp.text[:200]}"
+                )
+            else:
+                logger.info(f"site-diff auto-trigger queued for page {page_id}")
+    except Exception as e:
+        logger.warning(f"site-diff auto-trigger failed: {e}")
 
 
 async def _vendor_origin_css(manifest: dict) -> str:
