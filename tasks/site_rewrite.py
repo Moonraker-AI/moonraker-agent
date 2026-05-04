@@ -463,13 +463,13 @@ _MAX_IMAGE_LONG_EDGE = 1568
 def _compress_for_anthropic(png_bytes: bytes) -> tuple[bytes, str]:
     """Return (bytes, media_type) suitable for the Anthropic vision API.
 
-    Pass-through if the input is already under the size cap. Otherwise
-    resize the long edge to <=1568 px and re-encode as JPEG quality 85,
-    which is what Anthropic's documentation recommends for full-page
-    screenshots.
+    Anthropic enforces TWO independent limits per image:
+      - 5 MB raw bytes
+      - 8000 px on either dimension
+    Mobile full-page Squarespace screenshots routinely violate the
+    pixel dim limit (375 wide x ~12000 tall) even when bytes are fine.
+    Always probe pixel dims; resize when either limit would trip.
     """
-    if len(png_bytes) <= _MAX_IMAGE_BYTES:
-        return png_bytes, "image/png"
     try:
         from PIL import Image
     except ImportError:
@@ -479,9 +479,16 @@ def _compress_for_anthropic(png_bytes: bytes) -> tuple[bytes, str]:
 
     import io
     img = Image.open(io.BytesIO(png_bytes))
+    w, h = img.size
+
+    too_big_bytes = len(png_bytes) > _MAX_IMAGE_BYTES
+    too_big_dims = max(w, h) > _MAX_IMAGE_LONG_EDGE
+
+    if not too_big_bytes and not too_big_dims:
+        return png_bytes, "image/png"
+
     if img.mode not in ("RGB", "L"):
         img = img.convert("RGB")
-    w, h = img.size
     long_edge = max(w, h)
     if long_edge > _MAX_IMAGE_LONG_EDGE:
         scale = _MAX_IMAGE_LONG_EDGE / float(long_edge)
