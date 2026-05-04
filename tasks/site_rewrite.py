@@ -50,6 +50,7 @@ from typing import Optional
 import httpx
 
 from utils import r2_client
+from utils.asset_urls import public_asset_url
 from utils.astro_tokens import derive_overrides, render_override_css
 from utils.site_migration_db import (
     get_assets_for_migration,
@@ -103,13 +104,6 @@ CONTENT_TYPES = {
     ".webmanifest": "application/manifest+json",
     ".pdf": "application/pdf",
 }
-
-
-def _cf_image_delivery_url(cf_image_id: str, *, variant: str = "public") -> str:
-    h = os.getenv("CF_IMAGES_HASH", "")
-    if h:
-        return f"https://imagedelivery.net/{h}/{cf_image_id}/{variant}"
-    return f"cf:{cf_image_id}:{variant}"
 
 
 # ── Public entrypoint ────────────────────────────────────────────────────────
@@ -347,14 +341,34 @@ def _path_to_astro_route(page_path: str) -> str:
 # ── Asset map ────────────────────────────────────────────────────────────────
 
 def _build_asset_map(asset_rows: list[dict]) -> dict:
+    """Build origin -> public-URL map for the rewriter.
+
+    Each entry's `url` is the canonical public URL for the asset
+    (resolved via `public_asset_url`). When CF Images is enabled this
+    is an `imagedelivery.net` URL; otherwise it is the R2 Worker's
+    `/serve/<r2_key>` URL. Either way, the rewriter just uses what's
+    in `url` — Claude does not have to choose between providers.
+
+    `cf_url` is preserved for backwards compatibility with prompt
+    versions that referenced it; it mirrors `url` when CF Images is
+    active and is None otherwise.
+    """
     out: dict[str, dict] = {}
     for r in asset_rows:
         origin = r.get("origin_url")
         if not origin:
             continue
+        url = public_asset_url(r)
+        if not url:
+            # No usable URL (no cf_image_id with hash, no r2_key) — skip
+            # so Claude doesn't see a half-populated entry.
+            continue
         cf_id = r.get("cf_image_id")
-        cf_url = _cf_image_delivery_url(cf_id) if cf_id else None
+        # cf_url stays populated only when CF Images actually delivers the
+        # final URL — i.e., url itself is on imagedelivery.net.
+        cf_url = url if cf_id and url.startswith("https://imagedelivery.net/") else None
         out[origin] = {
+            "url": url,
             "cf_url": cf_url,
             "r2_key": r.get("r2_key"),
             "alt_text": r.get("alt_text") or "",
@@ -530,15 +544,23 @@ def _validate_astro(text: str, asset_map: dict) -> Optional[str]:
         )
 
     # ImageBlock src values must come from the asset map (best-effort —
-    # only enforce when ImageBlock is actually used).
+    # only enforce when ImageBlock is actually used). Accept either the
+    # canonical `url` (R2 Worker /serve/...) or the CF Images `cf_url`
+    # when present, since both are valid public URLs for the same asset.
     if "<ImageBlock" in body and asset_map:
-        cf_urls = {v.get("cf_url") for v in asset_map.values() if v.get("cf_url")}
+        allowed_srcs: set[str] = set()
+        for v in asset_map.values():
+            for k in ("url", "cf_url"):
+                u = v.get(k)
+                if u:
+                    allowed_srcs.add(u)
         for m in re.finditer(r'<ImageBlock\s+[^>]*src=["\']([^"\']+)["\']', body):
             src = m.group(1)
-            if cf_urls and src not in cf_urls:
+            if allowed_srcs and src not in allowed_srcs:
                 return (
                     f"ImageBlock src `{src}` is not in the asset map. Use only "
-                    "URLs listed under `cf_url` in the asset map."
+                    "URLs listed under `url` (or `cf_url` when present) in the "
+                    "asset map."
                 )
 
     return None
