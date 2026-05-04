@@ -152,19 +152,50 @@ async def log_error(
     page_id: Optional[str],
     error: str,
     extra: Optional[dict] = None,
+    severity: str = "error",
+    client_slug: Optional[str] = None,
 ) -> bool:
-    """Append a row to error_log so Vercel/CHQ can surface failures."""
+    """Append a row to error_log so Vercel/CHQ can surface failures.
+
+    The actual `error_log` table (shared with the Client HQ side, see
+    api/_lib/monitor.js) has these columns:
+        id, route, error_type, message, detail (jsonb), client_slug,
+        severity, created_at
+
+    Earlier versions of this helper sent `kind`/`migration_id`/`page_id`/
+    `error` as top-level fields, which PostgREST rejected with PGRST204
+    ("Could not find the 'error' column of 'error_log' in the schema
+    cache"). We now map agent-side fields onto the real columns:
+
+        kind          -> error_type   (e.g. 'site-capture')
+        kind          -> route        ('/tasks/<kind>')
+        error         -> message
+        page_id +     -> detail       (jsonb; merges with caller's extra)
+        migration_id     so the migration/page identifiers stay queryable
+                         without adding new columns.
+
+    Caller signature is unchanged; callers do not need updates.
+    """
     if not _ready():
         return False
-    payload: dict[str, Any] = {
-        "kind": kind,
+    detail: dict[str, Any] = {
         "migration_id": migration_id,
         "page_id": page_id,
-        "error": error[:4000] if error else "",
-        "created_at": _now(),
     }
     if extra:
-        payload["extra"] = extra
+        # Caller-supplied detail wins on key collision.
+        detail.update(extra)
+
+    payload: dict[str, Any] = {
+        "route": f"/tasks/{kind}" if kind else "/tasks/unknown",
+        "error_type": kind or "unknown",
+        "message": (error[:4000] if error else ""),
+        "detail": detail,
+        "severity": severity,
+        "created_at": _now(),
+    }
+    if client_slug:
+        payload["client_slug"] = client_slug
     try:
         async with httpx.AsyncClient(timeout=15) as client:
             resp = await client.post(
