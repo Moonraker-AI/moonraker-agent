@@ -103,7 +103,7 @@ async def run_site_capture(task_id, params, status_callback, env=None):
 
     # Pre-flight: R2 must be configured. CF Images optional.
     if not r2_client.is_configured():
-        msg = "R2 not configured (R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY / R2_ENDPOINT / R2_MIGRATION_BUCKET)"
+        msg = "R2 not configured (R2_INGEST_URL / R2_INGEST_SECRET / R2_MIGRATION_BUCKET)"
         logger.error(f"site-capture {task_id[:12]} aborted: {msg}")
         await log_error(kind="site-capture", migration_id=migration_id, page_id=page_id, error=msg)
         await status_callback(task_id, "error", msg)

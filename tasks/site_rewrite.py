@@ -125,7 +125,7 @@ async def run_site_rewrite(task_id, params, status_callback, env=None):
     await status_callback(task_id, "running", "site-rewrite starting")
 
     if not r2_client.is_configured():
-        msg = "R2 not configured (R2_* env vars)"
+        msg = "R2 not configured (R2_INGEST_URL / R2_INGEST_SECRET / R2_MIGRATION_BUCKET)"
         await log_error(kind="site-rewrite", migration_id=migration_id, page_id=page_id, error=msg)
         await status_callback(task_id, "error", msg)
         return
