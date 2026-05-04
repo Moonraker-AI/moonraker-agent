@@ -37,6 +37,8 @@ from tasks.sitemap_scout import run_sitemap_scout
 from tasks.sitemap_scout_stealth import run_sitemap_scout_stealth
 from tasks.surge_status_check import check_surge_status
 from tasks.design_audit import run_design_audit
+from tasks.site_capture import run_site_capture
+from tasks.site_rewrite import run_site_rewrite
 
 load_dotenv()
 
@@ -52,7 +54,7 @@ logger = logging.getLogger("agent")
 from utils.log_redact import install as _install_log_redact
 _install_log_redact()
 
-AGENT_VERSION = "0.7.6"
+AGENT_VERSION = "0.8.0"
 
 app = FastAPI(
     title="Moonraker Agent Service",
@@ -221,6 +223,40 @@ class CaptureDesignAssetsRequest(BaseModel):
     _v_service = field_validator("service_page_url")(classmethod(lambda cls, v: _validate_optional_http_url(v)))
     _v_about = field_validator("about_page_url")(classmethod(lambda cls, v: _validate_optional_http_url(v)))
     _v_callback = field_validator("callback_url")(classmethod(lambda cls, v: _validate_optional_http_url(v)))
+
+
+class SiteCaptureViewport(BaseModel):
+    name: str
+    width: int = Field(..., ge=240, le=4096)
+    height: int = Field(..., ge=240, le=4096)
+
+
+class SiteCaptureRequest(BaseModel):
+    """site-migration job 1: stealth-render a single page + harvest artifacts.
+
+    Spec: docs/site-migration-agent-job-spec.md §1.
+    """
+    migration_id: str
+    page_id: str
+    url: str
+    viewports: Optional[List[SiteCaptureViewport]] = None
+    block_third_party: Optional[List[str]] = None
+    scroll_to_load: bool = True
+    max_scroll_passes: int = Field(default=6, ge=0, le=20)
+    wait_strategy: Optional[str] = "networkidle"
+
+    _v_url = field_validator("url")(classmethod(lambda cls, v: _validate_http_url(v)))
+
+
+class SiteRewriteRequest(BaseModel):
+    """site-migration job 2: Claude rewrite + visual diff QA.
+
+    Spec: docs/site-migration-agent-job-spec.md §2.
+    """
+    migration_id: str
+    page_id: str
+    feedback: Optional[str] = None
+
 
 class NeoOverlayRequest(BaseModel):
     base_image_url: str
@@ -546,6 +582,66 @@ async def create_capture_design_assets(request: CaptureDesignAssetsRequest):
     )
 
     return {"task_id": task_id, "status": "queued"}
+
+
+@app.post("/tasks/site-capture", dependencies=[Depends(verify_api_key)])
+async def create_site_capture(request: SiteCaptureRequest):
+    """Site-migration job 1: stealth-render a single page + harvest artifacts.
+
+    Spec: docs/site-migration-agent-job-spec.md §1. Tier 2 (Light Browser):
+    acquires browser_lock for the duration of the capture.
+    """
+    task_id = f"site-capture-{uuid.uuid4()}"
+    now = datetime.now(timezone.utc).isoformat()
+
+    tasks[task_id] = {
+        "task_id": task_id,
+        "type": "site-capture",
+        "status": "queued",
+        "message": "Site capture queued, waiting for browser",
+        "created_at": now,
+        "updated_at": now,
+        "error": None,
+        "duration_seconds": None,
+        "request": request.model_dump(),
+    }
+
+    asyncio.create_task(_run_site_capture_with_lock(task_id))
+    logger.info(
+        f"Queued site-capture {task_id[:18]} migration={request.migration_id} "
+        f"page={request.page_id} url={request.url[:80]}"
+    )
+    return {"task_id": task_id, "queued": True, "status": "queued"}
+
+
+@app.post("/tasks/site-rewrite", dependencies=[Depends(verify_api_key)])
+async def create_site_rewrite(request: SiteRewriteRequest):
+    """Site-migration job 2: Claude rewrite + visual diff QA.
+
+    Spec: docs/site-migration-agent-job-spec.md §2. Tier 2 (Light Browser):
+    runs a fresh Playwright instance for visual-diff rendering only.
+    """
+    task_id = f"site-rewrite-{uuid.uuid4()}"
+    now = datetime.now(timezone.utc).isoformat()
+
+    tasks[task_id] = {
+        "task_id": task_id,
+        "type": "site-rewrite",
+        "status": "queued",
+        "message": "Site rewrite queued, waiting for Claude",
+        "created_at": now,
+        "updated_at": now,
+        "error": None,
+        "duration_seconds": None,
+        "request": request.model_dump(),
+    }
+
+    asyncio.create_task(_run_site_rewrite_with_lock(task_id))
+    logger.info(
+        f"Queued site-rewrite {task_id[:18]} migration={request.migration_id} "
+        f"page={request.page_id} feedback={'yes' if request.feedback else 'no'}"
+    )
+    return {"task_id": task_id, "queued": True, "status": "queued"}
 
 
 @app.post("/tasks/apply-neo-overlay", dependencies=[Depends(verify_api_key)])
@@ -994,6 +1090,54 @@ async def _run_capture_design_with_lock(task_id: str):
             logger.exception(f"Design capture {task_id[:12]} failed")
             update_task(task_id, "error", f"Unexpected error: {str(e)[:200]}", error=str(e))
         # Light browser task — short cooldown
+        await asyncio.sleep(LIGHT_TASK_COOLDOWN)
+
+
+async def _run_site_capture_with_lock(task_id: str):
+    """Tier 2 (Light Browser): Site-migration capture via stealth Playwright."""
+    async with browser_lock:
+        update_task(task_id, "running", "Starting site capture")
+        try:
+            await run_site_capture(
+                task_id=task_id,
+                params=tasks[task_id]["request"],
+                status_callback=_async_update_task,
+                env=None,
+            )
+        except Exception as e:
+            logger.exception(f"site-capture {task_id[:18]} failed")
+            update_task(
+                task_id,
+                "error",
+                f"Unexpected error: {str(e)[:200]}",
+                error=str(e),
+            )
+        await asyncio.sleep(LIGHT_TASK_COOLDOWN)
+
+
+async def _run_site_rewrite_with_lock(task_id: str):
+    """Tier 2 (Light Browser): Site-migration rewrite via Claude + visual diff.
+
+    Holds the browser lock because step 6 of the rewrite pipeline renders the
+    rewritten HTML in a fresh Playwright instance to compute the visual diff.
+    """
+    async with browser_lock:
+        update_task(task_id, "running", "Starting site rewrite")
+        try:
+            await run_site_rewrite(
+                task_id=task_id,
+                params=tasks[task_id]["request"],
+                status_callback=_async_update_task,
+                env=None,
+            )
+        except Exception as e:
+            logger.exception(f"site-rewrite {task_id[:18]} failed")
+            update_task(
+                task_id,
+                "error",
+                f"Unexpected error: {str(e)[:200]}",
+                error=str(e),
+            )
         await asyncio.sleep(LIGHT_TASK_COOLDOWN)
 
 
