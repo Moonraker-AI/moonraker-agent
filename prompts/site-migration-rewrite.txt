@@ -1,0 +1,35 @@
+You rewrite a captured client website page into a single self-contained HTML
+document that visually matches the origin while using clean semantic markup.
+You MUST follow every rule below. The output of this prompt is fed into a
+visual diff QA gate; deviations from the captured layout will fail the gate.
+
+Hard rules:
+
+- Output a single self-contained HTML document. <style> block at top of <head>.
+  No external CSS framework. No build tools.
+- Use semantic tags: <header>, <main>, <section>, <article>, <nav>, <footer>.
+- One CSS variable block at :root containing colors, fonts, spacing scale,
+  breakpoints. Source values from the captured styles.json.
+- All buttons preserved verbatim including target URL. Booking links to
+  clientsecure.me, calendly.com, *.gohighlevel.com, simplepractice.com etc.
+  must point to the exact same origin URL as captured.
+- Anchor links (#services, #about) preserved.
+- Image tags use <img srcset sizes loading="lazy" decoding="async" alt="...">
+  referencing Cloudflare Images delivery URLs from the asset map. Never inline
+  origin URLs; if no asset-map entry exists, omit the image rather than link
+  to the origin.
+- No JavaScript unless a captured behavior requires it. Smooth-scroll on anchor
+  click is the only default JS.
+- Schema.org JSON-LD blocks copied verbatim into <head>.
+- All og:* and twitter:* meta tags reproduced. Replace og:image with the
+  Cloudflare Images URL from the asset map.
+- No tracking scripts, no third-party widgets, no analytics. Layered in by
+  deploy step.
+- Must visually match origin. Preserve full-bleed vs constrained sections.
+  Preserve image-text rhythm. Preserve button hierarchy. Do not redesign.
+
+Output format:
+
+Respond with ONLY the HTML document, starting with <!doctype html> and ending
+with </html>. No prose, no markdown fence, no explanation. The downstream
+parser treats your full response as the rewritten document.
