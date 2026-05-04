@@ -192,6 +192,10 @@ async def run_site_rewrite(task_id, params, status_callback, env=None):
             screenshot_desktop = await r2_client.get_object(f"{raw_prefix}/screenshot-desktop.png")
         except Exception:
             screenshot_desktop = None
+        try:
+            screenshot_mobile = await r2_client.get_object(f"{raw_prefix}/screenshot-mobile.png")
+        except Exception:
+            screenshot_mobile = None
 
         section_pngs = await _list_section_screenshots(raw_prefix)
 
@@ -228,6 +232,7 @@ async def run_site_rewrite(task_id, params, status_callback, env=None):
             manifest=manifest,
             asset_map=asset_map,
             screenshot_desktop=screenshot_desktop,
+            screenshot_mobile=screenshot_mobile,
             section_pngs=section_pngs,
             feedback=feedback,
         )
@@ -638,6 +643,7 @@ async def _generate_and_validate(
     manifest: dict,
     asset_map: dict,
     screenshot_desktop: Optional[bytes],
+    screenshot_mobile: Optional[bytes],
     section_pngs: list[bytes],
     feedback: str,
 ) -> tuple[Optional[str], Optional[str]]:
@@ -664,6 +670,8 @@ async def _generate_and_validate(
         screenshot_blocks = []
         if screenshot_desktop:
             screenshot_blocks.append(_image_block(screenshot_desktop, "origin-desktop"))
+        if screenshot_mobile:
+            screenshot_blocks.append(_image_block(screenshot_mobile, "origin-mobile"))
         for idx, png in enumerate(section_pngs[:8]):
             screenshot_blocks.append(_image_block(png, f"origin-section-{idx:02d}"))
 

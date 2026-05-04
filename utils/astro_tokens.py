@@ -6,22 +6,15 @@ overrides for the Astro template's `src/styles/tokens.override.css`.
 
 Spec: docs/site-migration-agent-job-spec.md §2.5
 
+Goal: visual replica of the origin. Emit a CSS variable for every value
+we can derive from the captured computed styles. The migration template
+ships intentionally neutral defaults (system-ui, white bg, plain blue
+link) so any unmapped variable does NOT paint Moonraker brand onto the
+client's site — falls back to neutral instead.
+
 Inputs vary in shape across captured sites. We probe a handful of
-sensible paths inside `styles.json` and fall back to template defaults
-(Moonraker brand) when a value is missing or unparseable.
-
-Heuristics:
-- --color-primary: walk every captured `button.*` selector, pick the most
-  saturated non-neutral background color. If none qualifies, fall back to
-  the most saturated link color, then to the Moonraker brand green.
-- --font-display vs --font-body: if h1.fontFamily == body.fontFamily, only
-  emit --font-body so the template default for display can stand.
-- --type-scale-h1: derive a clamp(min, vw, max) from desktop+mobile h1 sizes
-  if both present; otherwise emit the desktop value as a fixed rem.
-- --spacing-section: scrape section.paddingTop (raw px), wrap in clamp().
-- --radius-md: button.borderRadius first, otherwise fall back.
-
-The function is pure and side-effect free; the caller writes the file.
+sensible paths inside `styles.json` and OMIT a variable when no value
+can be derived (rather than substituting a Moonraker default).
 """
 
 from __future__ import annotations
@@ -32,15 +25,6 @@ from typing import Any, Optional
 
 logger = logging.getLogger("agent.astro_tokens")
 
-# Moonraker template defaults — used as fallbacks when capture did not
-# resolve a usable value. Keep these in sync with src/styles/tokens.css
-# in moonraker-site-template.
-DEFAULT_PRIMARY = "#00D47E"
-DEFAULT_BG = "#FAFAF7"
-DEFAULT_TEXT = "#1A1A1A"
-DEFAULT_FONT_BODY = "'Inter', sans-serif"
-DEFAULT_FONT_DISPLAY = "'Outfit', sans-serif"
-DEFAULT_RADIUS_MD = "12px"
 
 NEUTRAL_HEXES = {
     "#000", "#000000", "#fff", "#ffffff",
@@ -53,11 +37,11 @@ NEUTRAL_HEXES = {
 # ── Color helpers ────────────────────────────────────────────────────────────
 
 def _normalize_hex(c: str) -> Optional[str]:
-    if not c:
+    if not c or not isinstance(c, str):
         return None
     c = c.strip().lower()
     if c.startswith("#"):
-        if len(c) == 4:  # #abc -> #aabbcc
+        if len(c) == 4:
             c = "#" + "".join(ch * 2 for ch in c[1:])
         if re.fullmatch(r"#[0-9a-f]{6}", c):
             return c
@@ -75,7 +59,6 @@ def _hex_to_rgb(h: str) -> tuple[int, int, int]:
 
 
 def _saturation(hex_color: str) -> float:
-    """HSL saturation in 0..1. Neutrals (gray/black/white) score very low."""
     r, g, b = (v / 255.0 for v in _hex_to_rgb(hex_color))
     mx, mn = max(r, g, b), min(r, g, b)
     if mx == mn:
@@ -85,10 +68,36 @@ def _saturation(hex_color: str) -> float:
     return d / (2 - mx - mn) if light > 0.5 else d / (mx + mn)
 
 
+def _lightness(hex_color: str) -> float:
+    r, g, b = (v / 255.0 for v in _hex_to_rgb(hex_color))
+    return (max(r, g, b) + min(r, g, b)) / 2
+
+
 def _is_neutral(hex_color: str) -> bool:
     if hex_color in NEUTRAL_HEXES:
         return True
     return _saturation(hex_color) < 0.12
+
+
+def _shift_lightness(hex_color: str, delta: float) -> str:
+    """Approximate ±delta lightness shift for hover-state derivation."""
+    r, g, b = _hex_to_rgb(hex_color)
+    if delta < 0:
+        r = max(0, int(r * (1 + delta)))
+        g = max(0, int(g * (1 + delta)))
+        b = max(0, int(b * (1 + delta)))
+    else:
+        r = min(255, int(r + (255 - r) * delta))
+        g = min(255, int(g + (255 - g) * delta))
+        b = min(255, int(b + (255 - b) * delta))
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+
+def _contrasting_text(hex_color: str) -> str:
+    """Return #ffffff or #000000 whichever has higher contrast against given bg."""
+    r, g, b = (v / 255.0 for v in _hex_to_rgb(hex_color))
+    luminance = 0.2126 * r + 0.7152 * g + 0.0722 * b
+    return "#000000" if luminance > 0.55 else "#ffffff"
 
 
 # ── styles.json walkers (defensive — schema varies by capture) ───────────────
@@ -103,186 +112,441 @@ def _get_path(obj: Any, *keys: str) -> Any:
     return cur
 
 
-def _find_selector_props(styles: dict, selector_prefix: str) -> list[dict]:
-    """Return all entries in styles whose key starts with `selector_prefix`.
-
-    `styles.json` from site-capture is a dict keyed by selector (e.g.
-    "body", "h1", "a", "button.btn-primary", "section.hero"), where each
-    value is a dict of computed-style props. Some captures wrap entries
-    under a top-level `selectors` key.
-    """
-    bag: dict
+def _styles_bag(styles: dict) -> dict:
+    """Return the dict that holds selector→props pairs, handling
+    {selectors: {...}} wrapper shape."""
+    if not isinstance(styles, dict):
+        return {}
     if isinstance(styles.get("selectors"), dict):
-        bag = styles["selectors"]
-    else:
-        bag = styles
+        return styles["selectors"]
+    return styles
+
+
+def _selector_props(styles: dict, selector: str) -> Optional[dict]:
+    """Return the dict of props for an exact selector match. Coerces lists
+    to first dict (some captures yield list-shaped entries)."""
+    bag = _styles_bag(styles)
+    val = bag.get(selector)
+    if isinstance(val, list):
+        val = next((x for x in val if isinstance(x, dict)), None)
+    if isinstance(val, dict):
+        return val
+    return None
+
+
+def _find_selectors_matching(styles: dict, predicate) -> list[tuple[str, dict]]:
+    bag = _styles_bag(styles)
     out = []
     for sel, props in (bag or {}).items():
-        if isinstance(sel, str) and isinstance(props, dict) and sel.startswith(selector_prefix):
-            out.append(props)
+        if not isinstance(sel, str):
+            continue
+        if isinstance(props, list):
+            props = next((x for x in props if isinstance(x, dict)), None)
+        if not isinstance(props, dict):
+            continue
+        if predicate(sel):
+            out.append((sel, props))
     return out
 
 
-def _pick_primary_color(styles: dict) -> str:
-    candidates: list[str] = []
-    for props in _find_selector_props(styles, "button"):
-        bg = _normalize_hex(props.get("backgroundColor") or props.get("background-color") or "")
-        if bg and not _is_neutral(bg):
-            candidates.append(bg)
-    if candidates:
-        return max(candidates, key=_saturation)
-    # Fall back to anchor color
-    link_candidates: list[str] = []
-    for props in _find_selector_props(styles, "a"):
-        c = _normalize_hex(props.get("color") or "")
-        if c and not _is_neutral(c):
-            link_candidates.append(c)
-    if link_candidates:
-        return max(link_candidates, key=_saturation)
-    return DEFAULT_PRIMARY
-
-
-def _pick_font(styles: dict, selector: str) -> Optional[str]:
-    props = _get_path(styles, selector) or _get_path(styles, "selectors", selector)
-    if not isinstance(props, dict):
-        return None
-    fam = props.get("fontFamily") or props.get("font-family")
-    if not fam or not isinstance(fam, str):
-        return None
-    return fam.strip()
-
-
-def _pick_color(styles: dict, selector: str, prop: str) -> Optional[str]:
-    props = _get_path(styles, selector) or _get_path(styles, "selectors", selector)
-    if not isinstance(props, dict):
-        return None
-    return _normalize_hex(props.get(prop) or "")
-
-
-def _parse_px(value: str) -> Optional[float]:
+def _parse_px(value: Any) -> Optional[float]:
     if not value or not isinstance(value, str):
         return None
     m = re.match(r"\s*([\d.]+)\s*px\s*$", value)
     return float(m.group(1)) if m else None
 
 
-def _h1_clamp(styles: dict) -> Optional[str]:
-    """Derive a clamp() for --type-scale-h1.
+def _px_to_rem(px: float) -> str:
+    return f"{px / 16.0:.3f}rem"
 
-    Capture may include desktop and mobile passes under different keys:
-    `h1`, `h1@desktop`, `h1@mobile`. Best-effort.
+
+def _prop(props: dict, *keys: str) -> Optional[str]:
+    """Get the first non-empty string value for any of the given prop keys.
+    Tolerates camelCase + kebab-case captures."""
+    for k in keys:
+        v = props.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return None
+
+
+# ── Role binning ─────────────────────────────────────────────────────────────
+
+def _is_button_selector(sel: str) -> bool:
+    s = sel.lower()
+    if s.startswith("button"):
+        return True
+    if "btn" in s or "button" in s:
+        return True
+    if "a.btn" in s or 'a[class*="btn"]' in s:
+        return True
+    return False
+
+
+def _is_primary_button(sel: str) -> bool:
+    s = sel.lower()
+    return any(t in s for t in ("primary", "main", "filled", "solid", "submit"))
+
+
+def _is_secondary_button(sel: str) -> bool:
+    s = sel.lower()
+    return any(t in s for t in ("secondary", "outline", "ghost", "tertiary", "alt"))
+
+
+def _is_nav_selector(sel: str) -> bool:
+    s = sel.lower()
+    return s.startswith("nav") or "navbar" in s or "site-nav" in s or s.startswith("header")
+
+
+def _is_hero_selector(sel: str) -> bool:
+    s = sel.lower()
+    return ".hero" in s or s == "hero" or "banner" in s or s.startswith("section.hero")
+
+
+def _is_footer_selector(sel: str) -> bool:
+    s = sel.lower()
+    return s.startswith("footer") or "site-footer" in s or s == ".footer"
+
+
+def _is_section_selector(sel: str) -> bool:
+    s = sel.lower()
+    return s == "section" or s.startswith("section ") or s == ".section"
+
+
+def bin_styles_by_role(styles: dict) -> dict[str, dict]:
+    """Group selector entries into named roles by simple substring heuristics.
+
+    Returns a dict like:
+        {
+          "nav": {merged props},
+          "hero": {...},
+          "primary_button": {...},
+          "secondary_button": {...},
+          "footer": {...},
+          "section": {...},
+          "body": {...},
+          "h1".."h6": {...},
+          "link": {...},
+        }
+
+    Each role's props are merged across all matching selectors with later
+    entries winning. Rough heuristic — good enough for token derivation.
     """
-    h1 = (
-        _get_path(styles, "h1")
-        or _get_path(styles, "selectors", "h1")
-        or {}
-    )
-    # Capture manifests sometimes yield a list of matched-selector dicts
-    # instead of a single dict — coerce to the first dict in that case.
-    if isinstance(h1, list):
-        h1 = next((x for x in h1 if isinstance(x, dict)), {})
-    if not isinstance(h1, dict):
-        h1 = {}
-    desktop = h1.get("fontSize") or h1.get("font-size") or ""
-    mobile = (
-        _get_path(styles, "h1@mobile", "fontSize")
-        or _get_path(styles, "h1@mobile", "font-size")
-        or _get_path(styles, "selectors", "h1@mobile", "fontSize")
-        or ""
-    )
-    d_px = _parse_px(desktop)
-    m_px = _parse_px(mobile)
-    if d_px and m_px and d_px != m_px:
-        lo = min(d_px, m_px) / 16.0
-        hi = max(d_px, m_px) / 16.0
-        return f"clamp({lo:.2f}rem, 6vw, {hi:.2f}rem)"
-    if d_px:
-        return f"{d_px / 16.0:.2f}rem"
-    return None
+    bag = _styles_bag(styles)
+    roles: dict[str, dict] = {
+        "nav": {},
+        "hero": {},
+        "primary_button": {},
+        "secondary_button": {},
+        "footer": {},
+        "section": {},
+        "body": {},
+        "link": {},
+        "h1": {}, "h2": {}, "h3": {}, "h4": {}, "h5": {}, "h6": {},
+    }
+
+    for sel, props in (bag or {}).items():
+        if not isinstance(sel, str):
+            continue
+        if isinstance(props, list):
+            props = next((x for x in props if isinstance(x, dict)), None)
+        if not isinstance(props, dict):
+            continue
+
+        s = sel.strip()
+        sl = s.lower()
+
+        if s == "body":
+            roles["body"].update(props)
+        if s in ("h1", "h2", "h3", "h4", "h5", "h6"):
+            roles[s].update(props)
+        if s == "a" or sl.startswith("a "):
+            roles["link"].update(props)
+        if _is_nav_selector(sl):
+            roles["nav"].update(props)
+        if _is_hero_selector(sl):
+            roles["hero"].update(props)
+        if _is_footer_selector(sl):
+            roles["footer"].update(props)
+        if _is_section_selector(sl):
+            roles["section"].update(props)
+        if _is_button_selector(sl):
+            if _is_primary_button(sl):
+                roles["primary_button"].update(props)
+            elif _is_secondary_button(sl):
+                roles["secondary_button"].update(props)
+            elif not roles["primary_button"]:
+                # Generic .btn falls into primary if no explicit primary seen
+                roles["primary_button"].update(props)
+
+    return roles
 
 
-def _section_spacing(styles: dict) -> Optional[str]:
-    pt = (
-        _get_path(styles, "section", "paddingTop")
-        or _get_path(styles, "selectors", "section", "paddingTop")
-        or _get_path(styles, "section", "padding-top")
-    )
-    px = _parse_px(pt) if isinstance(pt, str) else None
-    if not px:
-        return None
-    rem = px / 16.0
-    lo = max(2.0, rem * 0.6)
-    hi = rem
-    return f"clamp({lo:.2f}rem, 8vw, {hi:.2f}rem)"
+# ── Derivation routines (one per CSS variable family) ────────────────────────
+
+def _emit_color(out: dict, var: str, hex_value: Optional[str]):
+    if hex_value:
+        out[var] = hex_value
 
 
-def _button_radius(styles: dict) -> Optional[str]:
-    for props in _find_selector_props(styles, "button"):
-        br = props.get("borderRadius") or props.get("border-radius")
-        if isinstance(br, str) and br.strip() and br.strip() != "0px":
-            return br.strip()
-    return None
+def _derive_colors(out: dict, styles: dict, roles: dict[str, dict]):
+    body = roles.get("body") or {}
+    nav = roles.get("nav") or {}
+    hero = roles.get("hero") or {}
+    footer = roles.get("footer") or {}
+    section = roles.get("section") or {}
+    link = roles.get("link") or {}
+    pri_btn = roles.get("primary_button") or {}
+    sec_btn = roles.get("secondary_button") or {}
+
+    bg = _normalize_hex(_prop(body, "backgroundColor", "background-color"))
+    text = _normalize_hex(_prop(body, "color"))
+    _emit_color(out, "--color-bg", bg)
+    _emit_color(out, "--color-text", text)
+
+    # Alt background — try section bg or footer bg if different from body bg
+    sec_bg = _normalize_hex(_prop(section, "backgroundColor", "background-color"))
+    fb_bg = _normalize_hex(_prop(footer, "backgroundColor", "background-color"))
+    alt = None
+    for cand in (sec_bg, fb_bg):
+        if cand and cand != bg:
+            alt = cand
+            break
+    _emit_color(out, "--color-bg-alt", alt)
+
+    # Border — try common border color from button or section
+    sec_border = _normalize_hex(_prop(section, "borderColor", "border-color"))
+    if sec_border:
+        _emit_color(out, "--color-border", sec_border)
+
+    # Primary color — strongest candidate from primary button bg, then link color
+    pri_bg = _normalize_hex(_prop(pri_btn, "backgroundColor", "background-color"))
+    link_color = _normalize_hex(_prop(link, "color"))
+    primary = None
+    if pri_bg and not _is_neutral(pri_bg):
+        primary = pri_bg
+    elif link_color and not _is_neutral(link_color):
+        primary = link_color
+    if primary:
+        _emit_color(out, "--color-primary", primary)
+        _emit_color(out, "--color-primary-text", _contrasting_text(primary))
+        _emit_color(out, "--color-link", primary)
+        # Hover ≈ 12% darker
+        _emit_color(out, "--color-link-hover", _shift_lightness(primary, -0.12))
+
+    # Muted / subtle text — try footer color
+    footer_color = _normalize_hex(_prop(footer, "color"))
+    if footer_color and footer_color != text:
+        _emit_color(out, "--color-muted", footer_color)
+
+    # Nav paint
+    nav_bg = _normalize_hex(_prop(nav, "backgroundColor", "background-color"))
+    nav_color = _normalize_hex(_prop(nav, "color"))
+    _emit_color(out, "--nav-bg", nav_bg)
+    _emit_color(out, "--nav-text", nav_color)
+    _emit_color(out, "--nav-link-color", nav_color)
+
+    # Hero paint
+    hero_color = _normalize_hex(_prop(hero, "color"))
+    hero_bg = _normalize_hex(_prop(hero, "backgroundColor", "background-color"))
+    _emit_color(out, "--hero-text-color", hero_color)
+    if hero_bg:
+        _emit_color(out, "--hero-overlay-color", hero_bg)
+
+    # Footer paint
+    _emit_color(out, "--footer-bg", fb_bg)
+    _emit_color(out, "--footer-text", footer_color)
+
+    # Button paint (primary)
+    pri_color = _normalize_hex(_prop(pri_btn, "color"))
+    if pri_bg:
+        out["--button-bg"] = pri_bg
+    if pri_color:
+        out["--button-text"] = pri_color
+
+
+def _derive_typography(out: dict, styles: dict, roles: dict[str, dict]):
+    body = roles.get("body") or {}
+    body_font = _prop(body, "fontFamily", "font-family")
+    if body_font:
+        out["--font-body"] = body_font
+
+    # Heading font: take h1's family if different from body's, else inherit body
+    h1 = roles.get("h1") or {}
+    h1_font = _prop(h1, "fontFamily", "font-family")
+    if h1_font and (not body_font or h1_font.strip() != body_font.strip()):
+        out["--font-display"] = h1_font
+    elif body_font:
+        # explicit duplicate so display matches body
+        out["--font-display"] = body_font
+
+    # Type scale — desktop sizes for h1..h6
+    for h in ("h1", "h2", "h3", "h4", "h5", "h6"):
+        size = _parse_px(_prop(roles.get(h, {}), "fontSize", "font-size"))
+        if size:
+            out[f"--type-scale-{h}"] = _px_to_rem(size)
+
+    # Body type scale
+    body_size = _parse_px(_prop(body, "fontSize", "font-size"))
+    if body_size:
+        out["--type-scale-body"] = _px_to_rem(body_size)
+
+    # Line height + tracking on body
+    lh = _prop(body, "lineHeight", "line-height")
+    if lh:
+        try:
+            float(lh)
+            out["--type-leading-normal"] = lh
+        except ValueError:
+            lh_px = _parse_px(lh)
+            if lh_px and body_size:
+                out["--type-leading-normal"] = f"{lh_px / body_size:.3f}"
+
+    body_tracking = _prop(body, "letterSpacing", "letter-spacing")
+    if body_tracking and body_tracking != "normal":
+        out["--type-tracking-normal"] = body_tracking
+
+    # Heading line-height + tracking — borrow from h1
+    h1_lh = _prop(h1, "lineHeight", "line-height")
+    if h1_lh:
+        try:
+            float(h1_lh)
+            out["--type-leading-tight"] = h1_lh
+        except ValueError:
+            pass
+    h1_tracking = _prop(h1, "letterSpacing", "letter-spacing")
+    if h1_tracking and h1_tracking != "normal":
+        out["--type-tracking-tight"] = h1_tracking
+
+    # Heading weight
+    h1_weight = _prop(h1, "fontWeight", "font-weight")
+    if h1_weight:
+        out["--type-weight-display"] = h1_weight
+    body_weight = _prop(body, "fontWeight", "font-weight")
+    if body_weight:
+        out["--type-weight-body"] = body_weight
+
+
+def _derive_spacing(out: dict, styles: dict, roles: dict[str, dict]):
+    section = roles.get("section") or {}
+    pt = _parse_px(_prop(section, "paddingTop", "padding-top"))
+    pb = _parse_px(_prop(section, "paddingBottom", "padding-bottom"))
+    if pt and pb:
+        out["--spacing-section"] = _px_to_rem((pt + pb) / 2.0)
+    elif pt:
+        out["--spacing-section"] = _px_to_rem(pt)
+
+
+def _derive_buttons(out: dict, styles: dict, roles: dict[str, dict]):
+    pri = roles.get("primary_button") or {}
+    radius = _parse_px(_prop(pri, "borderRadius", "border-radius"))
+    if radius is not None:
+        if radius >= 100:
+            out["--button-radius"] = "999px"
+            out["--radius-md"] = "999px"
+        else:
+            out["--button-radius"] = f"{radius:.0f}px"
+            out["--radius-md"] = f"{radius:.0f}px"
+
+    pad_y = _parse_px(_prop(pri, "paddingTop", "padding-top"))
+    if pad_y:
+        out["--button-padding-y"] = _px_to_rem(pad_y)
+    pad_x = _parse_px(_prop(pri, "paddingLeft", "padding-left"))
+    if pad_x:
+        out["--button-padding-x"] = _px_to_rem(pad_x)
+
+    weight = _prop(pri, "fontWeight", "font-weight")
+    if weight:
+        out["--button-font-weight"] = weight
+    tt = _prop(pri, "textTransform", "text-transform")
+    if tt and tt != "none":
+        out["--button-text-transform"] = tt
+    tracking = _prop(pri, "letterSpacing", "letter-spacing")
+    if tracking and tracking != "normal":
+        out["--button-letter-spacing"] = tracking
+
+
+def _derive_radii(out: dict, styles: dict, roles: dict[str, dict]):
+    """Pull additional radii hints from images / cards if available."""
+    hero = roles.get("hero") or {}
+    hero_radius = _parse_px(_prop(hero, "borderRadius", "border-radius"))
+    if hero_radius and hero_radius > 0:
+        out["--radius-lg"] = f"{hero_radius:.0f}px"
 
 
 # ── Public API ───────────────────────────────────────────────────────────────
 
 def derive_overrides(styles: dict) -> dict[str, str]:
     """Return a CSS-var-name -> value mapping. Missing values omitted so the
-    template default (in tokens.css) wins via cascade."""
+    template's neutral default (in tokens.css) wins via cascade.
+
+    Visual-replica goal: emit as many vars as the captured styles support.
+    Anything unmapped falls back to neutral system defaults — never to
+    Moonraker brand.
+    """
     if not isinstance(styles, dict):
         styles = {}
 
+    roles = bin_styles_by_role(styles)
     out: dict[str, str] = {}
 
-    primary = _pick_primary_color(styles)
-    out["--color-primary"] = primary
-
-    bg = _pick_color(styles, "body", "backgroundColor") or _pick_color(styles, "body", "background-color")
-    if bg:
-        out["--color-bg"] = bg
-
-    text = _pick_color(styles, "body", "color")
-    if text:
-        out["--color-text"] = text
-
-    body_font = _pick_font(styles, "body")
-    h1_font = _pick_font(styles, "h1")
-    if body_font:
-        out["--font-body"] = body_font
-    if h1_font and (not body_font or h1_font.strip() != body_font.strip()):
-        out["--font-display"] = h1_font
-
-    h1_clamp = _h1_clamp(styles)
-    if h1_clamp:
-        out["--type-scale-h1"] = h1_clamp
-
-    spacing = _section_spacing(styles)
-    if spacing:
-        out["--spacing-section"] = spacing
-
-    radius = _button_radius(styles)
-    if radius:
-        out["--radius-md"] = radius
+    _derive_colors(out, styles, roles)
+    _derive_typography(out, styles, roles)
+    _derive_spacing(out, styles, roles)
+    _derive_buttons(out, styles, roles)
+    _derive_radii(out, styles, roles)
 
     return out
 
 
 def render_override_css(overrides: dict[str, str]) -> str:
-    """Render the overrides dict to a stable CSS string."""
+    """Render the overrides dict to a stable CSS string.
+
+    Variables NOT in overrides keep their value from tokens.css (neutral
+    system defaults). The migration template has been depoinionated so a
+    sparse override file does NOT paint Moonraker brand.
+    """
     if not overrides:
-        return "/* No per-site overrides — template defaults stand. */\n:root {}\n"
+        return (
+            "/* No per-site overrides — neutral template defaults stand. */\n"
+            ":root {}\n"
+        )
+
     lines = [
         "/* Auto-generated by agent.astro_tokens — derived from captured styles.json. */",
-        "/* Variables NOT listed here keep their value from tokens.css (Moonraker defaults). */",
+        "/* Variables NOT listed here keep their value from tokens.css (neutral defaults). */",
         ":root {",
     ]
-    # Stable ordering (cosmetic; aids diffing across re-runs)
+    # Stable ordering for diff readability
     order = [
-        "--color-primary", "--color-bg", "--color-text",
+        # Color
+        "--color-primary", "--color-primary-text",
+        "--color-bg", "--color-bg-alt",
+        "--color-text", "--color-muted", "--color-border",
+        "--color-link", "--color-link-hover",
+        # Typography
         "--font-display", "--font-body",
-        "--type-scale-h1",
+        "--type-scale-h1", "--type-scale-h2", "--type-scale-h3",
+        "--type-scale-h4", "--type-scale-h5", "--type-scale-h6",
+        "--type-scale-body",
+        "--type-weight-display", "--type-weight-body",
+        "--type-leading-tight", "--type-leading-normal",
+        "--type-tracking-tight", "--type-tracking-normal",
+        # Spacing
         "--spacing-section",
-        "--radius-md",
+        # Radius
+        "--radius-md", "--radius-lg",
+        # Button
+        "--button-bg", "--button-text",
+        "--button-radius", "--button-padding-x", "--button-padding-y",
+        "--button-font-weight", "--button-text-transform",
+        "--button-letter-spacing",
+        # Nav
+        "--nav-bg", "--nav-text", "--nav-link-color",
+        # Hero
+        "--hero-overlay-color", "--hero-text-color",
+        # Footer
+        "--footer-bg", "--footer-text",
     ]
     seen: set[str] = set()
     for key in order:
