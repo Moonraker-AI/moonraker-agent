@@ -177,6 +177,12 @@ def _h1_clamp(styles: dict) -> Optional[str]:
         or _get_path(styles, "selectors", "h1")
         or {}
     )
+    # Capture manifests sometimes yield a list of matched-selector dicts
+    # instead of a single dict — coerce to the first dict in that case.
+    if isinstance(h1, list):
+        h1 = next((x for x in h1 if isinstance(x, dict)), {})
+    if not isinstance(h1, dict):
+        h1 = {}
     desktop = h1.get("fontSize") or h1.get("font-size") or ""
     mobile = (
         _get_path(styles, "h1@mobile", "fontSize")
