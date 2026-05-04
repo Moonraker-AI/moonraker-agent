@@ -75,6 +75,23 @@ TEMPLATE_REPO_URL = os.getenv(
         "https://github.com/Moonraker-AI/moonraker-site-template.git",
     ),
 )
+
+
+_PAT_RE = re.compile(r'(x-access-token|oauth2|[\w.-]+):[^@\s]+@')
+
+
+def _redact_pat(s: str) -> str:
+    """Strip embedded GitHub PATs from URLs before logging.
+
+    site_rewrite uses a https://x-access-token:<PAT>@github.com/... URL
+    for cloning the private template repo. Subprocess error output and
+    Python exceptions surface that URL verbatim, which leaks the PAT to
+    logs / Supabase error_log / operator transcripts. Run all log
+    strings through this before they leave the process.
+    """
+    if not s:
+        return s
+    return _PAT_RE.sub(r'\1:REDACTED@', s)
 WORK_TREE_BASE = Path(os.getenv("SITE_BUILD_BASE", "/tmp/build"))
 
 NPM_INSTALL_TIMEOUT_S = 120
@@ -309,9 +326,10 @@ def _ensure_work_tree(work_tree: Path) -> None:
     cmd = ["git", "clone", "--depth=1", TEMPLATE_REPO_URL, str(work_tree)]
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
     if proc.returncode != 0:
+        safe_url = _redact_pat(TEMPLATE_REPO_URL)
+        safe_err = _redact_pat((proc.stderr or proc.stdout)[:500])
         raise RuntimeError(
-            f"git clone {TEMPLATE_REPO_URL} failed (rc={proc.returncode}): "
-            f"{(proc.stderr or proc.stdout)[:500]}"
+            f"git clone {safe_url} failed (rc={proc.returncode}): {safe_err}"
         )
     marker.write_text(datetime.now(timezone.utc).isoformat(), encoding="utf-8")
 
